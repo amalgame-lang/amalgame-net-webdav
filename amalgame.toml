@@ -1,6 +1,6 @@
 [package]
 name              = "amalgame-net-webdav"
-version           = "0.3.1"
+version           = "0.3.2"
 license           = "Apache-2.0"
 description       = "WebDAV server for the Mosaic stack — expose a filesystem directory over HTTP (the Apache mod_dav slice). Class 1 read/write (OPTIONS, PROPFIND, GET, HEAD, PUT, DELETE, MKCOL, COPY, MOVE) plus opt-in Class 2 locking (LOCK / UNLOCK). v0.3.0 adds WebDavNas — a multi-user NAS layer (per-user /home + a common /shared, one HTTP-Basic login each), with authentication delegated to the dedicated amalgame-auth package (WebDav itself is auth-agnostic). Works with Android WebDAV apps / Finder / Windows / davfs2 / rclone; deploy behind the Mosaic HTTPS host. Binary-safe GET (net-http File mode) and PUT (raw body buffer). Security: operator-fixed root, path traversal blocked (403), per-user isolation, auth fails closed (401). Directory enumeration via amalgame-io-filesystem; the handler is a pure HttpRequest -> HttpResponse dispatch."
 required-amalgame = ">=0.8.72"
@@ -11,25 +11,6 @@ amalgame-net-http       = ">=0.16.0"
 amalgame-io-filesystem  = ">=0.2.0"
 amalgame-datetime       = ">=0.2.2"
 amalgame-auth           = ">=0.1.0"
-
-# Pin transitive deps by git+tag so a precompile resolves the exact
-# versions (the shortname index may lag — e.g. io-filesystem needs >=0.2.0
-# for MakeDir/Move/Remove, but the index's latest shortname is v0.1.0).
-[dependencies.iofs]
-git = "github.com/amalgame-lang/amalgame-io-filesystem"
-tag = "v0.2.0"
-
-[dependencies.auth]
-git = "github.com/amalgame-lang/amalgame-auth"
-tag = "v0.1.0"
-
-[dependencies.http]
-git = "github.com/amalgame-lang/amalgame-net-http"
-tag = "v0.27.0"
-
-[dependencies.datetime]
-git = "github.com/amalgame-lang/amalgame-datetime"
-tag = "v0.2.2"
 
 [stdlib]
 classes   = ["WebDav", "DavLock", "DavLockStore", "WebDavNas"]
