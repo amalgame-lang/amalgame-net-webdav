@@ -1,0 +1,717 @@
+// amalgame-net-webdav — a WebDAV server for the Amalgame / Mosaic stack.
+//
+// Exposes a filesystem directory over HTTP/WebDAV (the Apache mod_dav
+// slice). The handler is a pure HttpRequest -> HttpResponse dispatch, so
+// it mounts on a Mosaic host (MosaicServer.AddHandler) or a WebApp
+// catch-all route, and is unit-testable without a live socket.
+//
+//   import Amalgame.Net.WebDav
+//
+//   let dav = WebDav.New("/srv/share", "/dav")   // serve dir at URL prefix
+//   let resp = dav.Dispatch(req)                  // HttpRequest -> HttpResponse
+//
+// Class 1 (OPTIONS, PROPFIND, GET, HEAD, PUT, DELETE, MKCOL, COPY, MOVE)
+// is always on. Class 2 locking (LOCK / UNLOCK + If/423 enforcement) is
+// opt-in via .WithLocks(). Read-only mode (.ReadOnly()) rejects every
+// mutating verb with 403.
+//
+// SECURITY: the served root is fixed by the operator, never derived from
+// client input; request paths are stripped of the URL prefix and any
+// "../" traversal segment is rejected (403) before touching the disk —
+// a request can never escape the served root.
+//
+// Binary-safety: GET ships bytes straight off disk via net-http's File
+// mode (H1Conn_RespondFile, NUL-safe); PUT writes the raw request body
+// buffer (BodyPtr/BodyLen) verbatim; COPY streams bytes. No payload is
+// strlen-truncated.
+
+namespace Amalgame.Net.WebDav
+
+import Amalgame.Collections
+import Amalgame.String
+import Amalgame.Net.Http
+import Amalgame.IO.Filesystem
+import Amalgame.DateTime
+
+@c {
+    #include <stdio.h>
+    #include <stdint.h>
+    #include <string.h>
+}
+
+// ─────────────────────────────────────────────────────────────────────
+//  DavLock — one active lock (Class 2). Exclusive write locks only.
+// ─────────────────────────────────────────────────────────────────────
+public class DavLock {
+    public Path:      string   // resource path, relative + cleaned ("" = root)
+    public Token:     string   // opaque lock token
+    public Infinite:  bool     // depth: true = infinity, false = 0
+    public Owner:     string   // owner hint from the LOCK body (informational)
+    public ExpiresAt: int      // absolute expiry, DateTime.NowNanos() scale
+
+    public DavLock() {
+        this.Path = ""; this.Token = ""; this.Infinite = false
+        this.Owner = ""; this.ExpiresAt = 0
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+//  DavLockStore — in-memory lock table (single-process). Linear scan;
+//  fine for the moderate lock counts a file share sees.
+// ─────────────────────────────────────────────────────────────────────
+public class DavLockStore {
+    public Locks:  List<DavLock>
+    public NextId: int
+
+    public DavLockStore() {
+        this.Locks  = new List<DavLock>()
+        this.NextId = 1
+    }
+
+    // Mint a unique opaque lock token.
+    public string MintToken() {
+        let id: int = this.NextId
+        this.NextId = id + 1
+        let ns: int = DateTime.NowNanos()
+        return "opaquelocktoken:" + String_FromInt(ns) + "-" + String_FromInt(id)
+    }
+
+    // Active (non-expired) lock that COVERS `rel`: an exact lock on the
+    // path, or an infinite-depth lock on an ancestor. null if none.
+    public DavLock Covering(rel: string) {
+        let now: int = DateTime.NowNanos()
+        var i: int = 0
+        while (i < this.Locks.Count()) {
+            let lk: DavLock = this.Locks.Get(i)
+            if (lk.ExpiresAt > now) {
+                if (lk.Path == rel) { return lk }
+                if (lk.Infinite) {
+                    let pfx: string = lk.Path + "/"
+                    if (lk.Path == "" || String_StartsWith(rel, pfx)) { return lk }
+                }
+            }
+            i = i + 1
+        }
+        return null
+    }
+
+    // Find an active lock by exact path. null if none.
+    public DavLock ByPath(rel: string) {
+        let now: int = DateTime.NowNanos()
+        var i: int = 0
+        while (i < this.Locks.Count()) {
+            let lk: DavLock = this.Locks.Get(i)
+            if (lk.ExpiresAt > now && lk.Path == rel) { return lk }
+            i = i + 1
+        }
+        return null
+    }
+
+    public void Add(lk: DavLock) { this.Locks.Add(lk) }
+
+    // Remove a lock by token. Returns true if one was removed.
+    public bool RemoveToken(token: string) {
+        let keep: List<DavLock> = new List<DavLock>()
+        var found: bool = false
+        var i: int = 0
+        while (i < this.Locks.Count()) {
+            let lk: DavLock = this.Locks.Get(i)
+            if (lk.Token == token) { found = true } else { keep.Add(lk) }
+            i = i + 1
+        }
+        this.Locks = keep
+        return found
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+//  WebDav — the handler. Serves `Root` (a filesystem directory) under
+//  the URL `Prefix`.
+// ─────────────────────────────────────────────────────────────────────
+public class WebDav {
+    public Root:         string        // served filesystem dir (no trailing /)
+    public Prefix:       string        // URL prefix, e.g. "/dav" ("" = site root)
+    public Writable:     bool          // mutating verbs allowed
+    public LocksEnabled: bool          // Class 2 LOCK/UNLOCK on
+    public Locks:        DavLockStore
+
+    public WebDav() {
+        this.Root = ""; this.Prefix = ""
+        this.Writable = true; this.LocksEnabled = false
+        this.Locks = new DavLockStore()
+    }
+
+    // root: filesystem directory to expose. prefix: URL path it lives at
+    // ("" or "/" to serve at the site root).
+    public static WebDav New(root: string, prefix: string) {
+        let d = new WebDav()
+        d.Root   = WebDav.TrimTrailingSlash(root)
+        d.Prefix = WebDav.TrimTrailingSlash(prefix)
+        return d
+    }
+
+    public WebDav ReadOnly()  { this.Writable = false;     return this }
+    public WebDav WithLocks() { this.LocksEnabled = true;  return this }
+
+    // ── main dispatch ──────────────────────────────────────────────
+    public HttpResponse Dispatch(req: HttpRequest) {
+        let m: string = req.Method
+
+        let raw: string = this.StripPrefix(req.Path)
+        if (WebDav.HasTraversal(raw)) { return WebDav.Empty(403) }
+        let rel: string = WebDav.CleanRel(raw)
+        let fs:  string = this.FsPath(rel)
+
+        // Write-verb gate (read-only mode).
+        if (!this.Writable && WebDav.IsWriteMethod(m)) { return WebDav.Empty(403) }
+
+        // Lock gate (Class 2): mutating a locked resource without the
+        // token is 423 Locked.
+        if (this.LocksEnabled && WebDav.IsWriteMethod(m) && m != "LOCK") {
+            if (this.Blocked(rel, req)) { return WebDav.Empty(423) }
+        }
+
+        if (m == "OPTIONS")   { return this.DoOptions() }
+        if (m == "GET")       { return this.DoGet(rel, fs, true) }
+        if (m == "HEAD")      { return this.DoGet(rel, fs, false) }
+        if (m == "PUT")       { return this.DoPut(req, fs) }
+        if (m == "DELETE")    { return this.DoDelete(fs) }
+        if (m == "MKCOL")     { return this.DoMkcol(req, fs) }
+        if (m == "COPY")      { return this.DoCopyMove(req, rel, fs, false) }
+        if (m == "MOVE")      { return this.DoCopyMove(req, rel, fs, true) }
+        if (m == "PROPFIND")  { return this.DoPropfind(req, rel, fs) }
+        if (m == "PROPPATCH") { return this.DoProppatch(rel) }
+        if (m == "LOCK")      { return this.DoLock(req, rel, fs) }
+        if (m == "UNLOCK")    { return this.DoUnlock(req) }
+
+        return WebDav.Empty(405)
+    }
+
+    // ── OPTIONS ────────────────────────────────────────────────────
+    HttpResponse DoOptions() {
+        var allow: string = "OPTIONS, HEAD, GET, PROPFIND"
+        if (this.Writable) {
+            allow = allow + ", PUT, DELETE, MKCOL, COPY, MOVE, PROPPATCH"
+        }
+        var dav: string = "1"
+        if (this.LocksEnabled) {
+            dav = "1, 2"
+            if (this.Writable) { allow = allow + ", LOCK, UNLOCK" }
+        }
+        let r = HttpResponse.New().Status(200)
+        r.Header("DAV", dav)
+        r.Header("Allow", allow)
+        r.Header("MS-Author-Via", "DAV")
+        r.Header("Content-Length", "0")
+        return r
+    }
+
+    // ── GET / HEAD ─────────────────────────────────────────────────
+    HttpResponse DoGet(rel: string, fs: string, withBody: bool) {
+        if (!File.Exists(fs)) { return WebDav.Empty(404) }
+        if (Filesystem.IsDir(fs)) {
+            // GET on a collection: a plain text child listing (HEAD: none).
+            var body: string = ""
+            let names: List<string> = Filesystem.List(fs)
+            var i: int = 0
+            while (i < names.Count()) { body = body + names.Get(i) + "\n"; i = i + 1 }
+            let r = HttpResponse.New().Status(200)
+            r.Header("Content-Type", "text/plain; charset=utf-8")
+            if (withBody) { r.BodyText = body }
+            return r
+        }
+        if (!withBody) {
+            // HEAD on a file: headers only.
+            let h = HttpResponse.New().Status(200)
+            h.Header("Content-Type", WebDav.MimeOf(fs))
+            return h
+        }
+        // GET on a file: binary-safe File mode (net-http H1Conn_RespondFile).
+        let r = HttpResponse.New().Status(200).File(fs)
+        r.Header("Content-Type", WebDav.MimeOf(fs))
+        return r
+    }
+
+    // ── PUT ────────────────────────────────────────────────────────
+    HttpResponse DoPut(req: HttpRequest, fs: string) {
+        if (File.Exists(fs) && Filesystem.IsDir(fs)) { return WebDav.Empty(405) }
+        let parent: string = WebDav.ParentOf(fs)
+        if (!Filesystem.IsDir(parent)) { return WebDav.Empty(409) }
+        let created: bool = !File.Exists(fs)
+        if (!WebDav.WriteBody(req, fs)) { return WebDav.Empty(500) }
+        if (created) { return WebDav.Empty(201) }
+        return WebDav.Empty(204)
+    }
+
+    // ── DELETE ─────────────────────────────────────────────────────
+    HttpResponse DoDelete(fs: string) {
+        if (!File.Exists(fs)) { return WebDav.Empty(404) }
+        if (!Filesystem.Remove(fs)) { return WebDav.Empty(500) }
+        return WebDav.Empty(204)
+    }
+
+    // ── MKCOL ──────────────────────────────────────────────────────
+    HttpResponse DoMkcol(req: HttpRequest, fs: string) {
+        if (String_Length(req.Body) > 0 || req.BodyLen > 0) { return WebDav.Empty(415) }
+        if (File.Exists(fs)) { return WebDav.Empty(405) }
+        let parent: string = WebDav.ParentOf(fs)
+        if (!Filesystem.IsDir(parent)) { return WebDav.Empty(409) }
+        if (!Filesystem.MakeDir(fs)) { return WebDav.Empty(500) }
+        return WebDav.Empty(201)
+    }
+
+    // ── COPY / MOVE ────────────────────────────────────────────────
+    HttpResponse DoCopyMove(req: HttpRequest, srcRel: string, srcFs: string, isMove: bool) {
+        if (!File.Exists(srcFs)) { return WebDav.Empty(404) }
+
+        let destHdr: string = req.Header("destination")
+        if (String_Length(destHdr) == 0) { return WebDav.Empty(400) }
+        let destRaw: string = this.StripPrefix(WebDav.UrlPathOf(destHdr))
+        if (WebDav.HasTraversal(destRaw)) { return WebDav.Empty(400) }
+        let destRel: string = WebDav.CleanRel(destRaw)
+        let destFs:  string = this.FsPath(destRel)
+
+        // A MOVE/COPY onto its own path is a no-op success.
+        if (destRel == srcRel) { return WebDav.Empty(204) }
+
+        // Lock gate on the destination too.
+        if (this.LocksEnabled && this.Blocked(destRel, req)) { return WebDav.Empty(423) }
+
+        let overwrite: string = req.Header("overwrite")
+        let destExists: bool = File.Exists(destFs)
+        if (destExists && overwrite == "F") { return WebDav.Empty(412) }
+        if (!Filesystem.IsDir(WebDav.ParentOf(destFs))) { return WebDav.Empty(409) }
+        if (destExists) { Filesystem.Remove(destFs) }
+
+        if (isMove) {
+            if (!Filesystem.Move(srcFs, destFs)) { return WebDav.Empty(409) }
+        } else {
+            if (!WebDav.CopyTree(srcFs, destFs)) { return WebDav.Empty(500) }
+        }
+        if (destExists) { return WebDav.Empty(204) }
+        return WebDav.Empty(201)
+    }
+
+    // ── PROPFIND ───────────────────────────────────────────────────
+    HttpResponse DoPropfind(req: HttpRequest, rel: string, fs: string) {
+        if (!File.Exists(fs)) { return WebDav.Empty(404) }
+        // Depth: "0" = just the resource; anything else (1 / infinity) is
+        // treated as one level (deep walks are intentionally not done).
+        let depth: string = req.Header("depth")
+        let oneLevel: bool = (depth != "0")
+
+        var body: string = WebDav.XmlHead() + "<D:multistatus xmlns:D=\"DAV:\">"
+        body = body + this.PropEntry(rel, fs)
+        if (oneLevel && Filesystem.IsDir(fs)) {
+            let names: List<string> = Filesystem.List(fs)
+            var i: int = 0
+            while (i < names.Count()) {
+                let childRel: string = WebDav.JoinRel(rel, names.Get(i))
+                body = body + this.PropEntry(childRel, this.FsPath(childRel))
+                i = i + 1
+            }
+        }
+        body = body + "</D:multistatus>"
+
+        let r = HttpResponse.New().Status(207)
+        r.Header("Content-Type", "application/xml; charset=utf-8")
+        r.BodyText = body
+        return r
+    }
+
+    // One <D:response> for a single resource.
+    string PropEntry(rel: string, fs: string) {
+        let isDir: bool = Filesystem.IsDir(fs)
+        let name:  string = WebDav.DisplayName(rel)
+        var x: string = "<D:response><D:href>" + WebDav.XmlEscape(this.Href(rel, isDir)) + "</D:href>"
+        x = x + "<D:propstat><D:prop>"
+        x = x + "<D:displayname>" + WebDav.XmlEscape(name) + "</D:displayname>"
+        if (isDir) {
+            x = x + "<D:resourcetype><D:collection/></D:resourcetype>"
+        } else {
+            x = x + "<D:resourcetype/>"
+            x = x + "<D:getcontentlength>" + String_FromInt(WebDav.FileSize(fs)) + "</D:getcontentlength>"
+            x = x + "<D:getcontenttype>" + WebDav.XmlEscape(WebDav.MimeOf(fs)) + "</D:getcontenttype>"
+        }
+        x = x + "<D:getlastmodified>" + DateTime.FormatHttpDate(WebDav.FileMtime(fs)) + "</D:getlastmodified>"
+        x = x + "</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>"
+        return x
+    }
+
+    // ── PROPPATCH ──────────────────────────────────────────────────
+    // Property mutation is not persisted yet: respond 207 marking the
+    // request 403 Forbidden (spec-clean), rather than silently lying.
+    HttpResponse DoProppatch(rel: string) {
+        var body: string = WebDav.XmlHead() + "<D:multistatus xmlns:D=\"DAV:\">"
+        body = body + "<D:response><D:href>" + WebDav.XmlEscape(this.Href(rel, false)) + "</D:href>"
+        body = body + "<D:propstat><D:prop/><D:status>HTTP/1.1 403 Forbidden</D:status></D:propstat>"
+        body = body + "</D:response></D:multistatus>"
+        let r = HttpResponse.New().Status(207)
+        r.Header("Content-Type", "application/xml; charset=utf-8")
+        r.BodyText = body
+        return r
+    }
+
+    // ── LOCK / UNLOCK (Class 2, opt-in) ────────────────────────────
+    HttpResponse DoLock(req: HttpRequest, rel: string, fs: string) {
+        if (!this.LocksEnabled) { return WebDav.Empty(405) }
+
+        let existing: DavLock = this.Locks.ByPath(rel)
+        let ifh: string = req.Header("if")
+
+        // Refresh: a LOCK with no body carrying the existing token.
+        if (existing != null) {
+            if (String_IndexOf(ifh, existing.Token) >= 0) {
+                existing.ExpiresAt = DateTime.NowNanos() + WebDav.TimeoutNanos(req)
+                return this.LockResponse(existing, rel, false)
+            }
+            return WebDav.Empty(423)   // locked by someone else
+        }
+
+        // New lock. LOCK on a missing path creates an empty (lock-null)
+        // resource, provided its parent collection exists.
+        var created: bool = false
+        if (!File.Exists(fs)) {
+            if (!Filesystem.IsDir(WebDav.ParentOf(fs))) { return WebDav.Empty(409) }
+            if (!File.WriteAll(fs, "")) { return WebDav.Empty(500) }
+            created = true
+        }
+
+        let lk = new DavLock()
+        lk.Path      = rel
+        lk.Token     = this.Locks.MintToken()
+        lk.Infinite  = (req.Header("depth") != "0")
+        lk.Owner     = req.Body
+        lk.ExpiresAt = DateTime.NowNanos() + WebDav.TimeoutNanos(req)
+        this.Locks.Add(lk)
+        return this.LockResponse(lk, rel, created)
+    }
+
+    HttpResponse DoUnlock(req: HttpRequest) {
+        if (!this.LocksEnabled) { return WebDav.Empty(405) }
+        let token: string = WebDav.StripAngles(req.Header("lock-token"))
+        if (String_Length(token) == 0) { return WebDav.Empty(400) }
+        if (!this.Locks.RemoveToken(token)) { return WebDav.Empty(409) }
+        return WebDav.Empty(204)
+    }
+
+    HttpResponse LockResponse(lk: DavLock, rel: string, created: bool) {
+        var depth: string = "0"
+        if (lk.Infinite) { depth = "infinity" }
+        var body: string = WebDav.XmlHead() + "<D:prop xmlns:D=\"DAV:\"><D:lockdiscovery><D:activelock>"
+        body = body + "<D:locktype><D:write/></D:locktype>"
+        body = body + "<D:lockscope><D:exclusive/></D:lockscope>"
+        body = body + "<D:depth>" + depth + "</D:depth>"
+        body = body + "<D:timeout>Second-3600</D:timeout>"
+        body = body + "<D:locktoken><D:href>" + WebDav.XmlEscape(lk.Token) + "</D:href></D:locktoken>"
+        body = body + "<D:lockroot><D:href>" + WebDav.XmlEscape(this.Href(rel, false)) + "</D:href></D:lockroot>"
+        body = body + "</D:activelock></D:lockdiscovery></D:prop>"
+        var code: int = 200
+        if (created) { code = 201 }
+        let r = HttpResponse.New().Status(code)
+        r.Header("Content-Type", "application/xml; charset=utf-8")
+        r.Header("Lock-Token", "<" + lk.Token + ">")
+        r.BodyText = body
+        return r
+    }
+
+    // True if `rel` is locked and the request didn't present the token.
+    bool Blocked(rel: string, req: HttpRequest) {
+        let lk: DavLock = this.Locks.Covering(rel)
+        if (lk == null) { return false }
+        let ifh: string = req.Header("if")
+        if (String_IndexOf(ifh, lk.Token) >= 0) { return false }
+        return true
+    }
+
+    // ── path mapping helpers ───────────────────────────────────────
+    string StripPrefix(path: string) {
+        var p: string = path
+        let pl: int = String_Length(this.Prefix)
+        if (pl > 0 && String_StartsWith(p, this.Prefix)) {
+            p = String_Substring(p, pl, String_Length(p) - pl)
+        }
+        return p
+    }
+
+    string FsPath(rel: string) {
+        if (String_Length(rel) == 0) { return this.Root }
+        return this.Root + "/" + rel
+    }
+
+    // URL href for a resource (collections get a trailing slash).
+    string Href(rel: string, isDir: bool) {
+        var h: string = this.Prefix
+        if (String_Length(rel) == 0) {
+            h = h + "/"
+        } else {
+            h = h + "/" + rel
+            if (isDir) { h = h + "/" }
+        }
+        if (!String_StartsWith(h, "/")) { h = "/" + h }
+        return h
+    }
+
+    // ── static helpers ─────────────────────────────────────────────
+
+    // true if any path segment is "..".
+    static bool HasTraversal(p: string) {
+        let segs: List<string> = String_Split(p, "/")
+        var i: int = 0
+        while (i < segs.Count()) {
+            if (segs.Get(i) == "..") { return true }
+            i = i + 1
+        }
+        return false
+    }
+
+    // Drop empty + "." segments, join with "/". ("" = the root.)
+    static string CleanRel(p: string) {
+        let segs: List<string> = String_Split(p, "/")
+        var out: string = ""
+        var i: int = 0
+        while (i < segs.Count()) {
+            let s: string = segs.Get(i)
+            if (s != "" && s != ".") {
+                if (String_Length(out) == 0) { out = s } else { out = out + "/" + s }
+            }
+            i = i + 1
+        }
+        return out
+    }
+
+    static string JoinRel(rel: string, name: string) {
+        if (String_Length(rel) == 0) { return name }
+        return rel + "/" + name
+    }
+
+    static bool IsWriteMethod(m: string) {
+        if (m == "PUT")       { return true }
+        if (m == "DELETE")    { return true }
+        if (m == "MKCOL")     { return true }
+        if (m == "COPY")      { return true }
+        if (m == "MOVE")      { return true }
+        if (m == "PROPPATCH") { return true }
+        if (m == "LOCK")      { return true }
+        return false
+    }
+
+    static string TrimTrailingSlash(s: string) {
+        var x: string = s
+        while (String_Length(x) > 1 && String_EndsWith(x, "/")) {
+            x = String_Substring(x, 0, String_Length(x) - 1)
+        }
+        if (x == "/") { return "" }
+        return x
+    }
+
+    static string ParentOf(fs: string) {
+        let i: int = WebDav.LastIndexOf(fs, "/")
+        if (i <= 0) { return "/" }
+        return String_Substring(fs, 0, i)
+    }
+
+    static string DisplayName(rel: string) {
+        if (String_Length(rel) == 0) { return "/" }
+        let i: int = WebDav.LastIndexOf(rel, "/")
+        if (i < 0) { return rel }
+        return String_Substring(rel, i + 1, String_Length(rel) - i - 1)
+    }
+
+    // Extract the path part of a Destination header (full URL or absolute
+    // path), percent-decoded.
+    static string UrlPathOf(dest: string) {
+        var d: string = dest
+        let scheme: int = String_IndexOf(d, "://")
+        if (scheme >= 0) {
+            let rest: string = String_Substring(d, scheme + 3, String_Length(d) - scheme - 3)
+            let slash: int = String_IndexOf(rest, "/")
+            if (slash >= 0) {
+                d = String_Substring(rest, slash, String_Length(rest) - slash)
+            } else {
+                d = "/"
+            }
+        }
+        return HttpRequest.UrlDecode(d)
+    }
+
+    static string StripAngles(s: string) {
+        var x: string = String_Trim(s)
+        if (String_StartsWith(x, "<")) { x = String_Substring(x, 1, String_Length(x) - 1) }
+        if (String_EndsWith(x, ">"))  { x = String_Substring(x, 0, String_Length(x) - 1) }
+        return x
+    }
+
+    static int LastIndexOf(s: string, ch: string) {
+        var idx: int = -1
+        let n: int = String_Length(s)
+        var i: int = 0
+        while (i < n) {
+            if (String_CharAt1(s, i) == ch) { idx = i }
+            i = i + 1
+        }
+        return idx
+    }
+
+    static string XmlHead() { return "<?xml version=\"1.0\" encoding=\"utf-8\"?>" }
+
+    static string XmlEscape(s: string) {
+        let amp: string = "&"
+        let lt:  string = "<"
+        let gt:  string = ">"
+        let q:   string = String_FromByte(34)
+        var out: string = ""
+        let n: int = String_Length(s)
+        var i: int = 0
+        while (i < n) {
+            let c: string = String_CharAt1(s, i)
+            if (c == amp)      { out = out + "&amp;" }
+            else if (c == lt)  { out = out + "&lt;" }
+            else if (c == gt)  { out = out + "&gt;" }
+            else if (c == q)   { out = out + "&quot;" }
+            else               { out = out + c }
+            i = i + 1
+        }
+        return out
+    }
+
+    // Parse "Timeout: Second-NNN" to nanoseconds; default 3600 s.
+    static int TimeoutNanos(req: HttpRequest) {
+        var secs: int = 3600
+        let t: string = String_ToLower(req.Header("timeout"))
+        let idx: int = String_IndexOf(t, "second-")
+        if (idx >= 0) {
+            let rest: string = String_Substring(t, idx + 7, String_Length(t) - idx - 7)
+            let v: int = WebDav.ParseLeadingInt(rest)
+            if (v > 0) { secs = v }
+        }
+        return secs * 1000000000
+    }
+
+    static int ParseLeadingInt(s: string) {
+        var v: int = 0
+        var any: bool = false
+        let n: int = String_Length(s)
+        var i: int = 0
+        while (i < n) {
+            let c: string = String_CharAt1(s, i)
+            let d: int = WebDav.Digit(c)
+            if (d < 0) { i = n } else { v = v * 10 + d; any = true; i = i + 1 }
+        }
+        if (!any) { return -1 }
+        return v
+    }
+
+    static int Digit(c: string) {
+        if (c == "0") { return 0 }
+        if (c == "1") { return 1 }
+        if (c == "2") { return 2 }
+        if (c == "3") { return 3 }
+        if (c == "4") { return 4 }
+        if (c == "5") { return 5 }
+        if (c == "6") { return 6 }
+        if (c == "7") { return 7 }
+        if (c == "8") { return 8 }
+        if (c == "9") { return 9 }
+        return -1
+    }
+
+    static HttpResponse Empty(code: int) {
+        let r = HttpResponse.New().Status(code)
+        r.Header("Content-Length", "0")
+        return r
+    }
+
+    static string MimeOf(path: string) {
+        let i: int = WebDav.LastIndexOf(path, ".")
+        if (i < 0) { return "application/octet-stream" }
+        let e: string = String_ToLower(String_Substring(path, i + 1, String_Length(path) - i - 1))
+        if (e == "html" || e == "htm") { return "text/html; charset=utf-8" }
+        if (e == "txt" || e == "md")   { return "text/plain; charset=utf-8" }
+        if (e == "css")  { return "text/css; charset=utf-8" }
+        if (e == "js")   { return "application/javascript" }
+        if (e == "json") { return "application/json" }
+        if (e == "xml")  { return "application/xml" }
+        if (e == "png")  { return "image/png" }
+        if (e == "jpg" || e == "jpeg") { return "image/jpeg" }
+        if (e == "gif")  { return "image/gif" }
+        if (e == "svg")  { return "image/svg+xml" }
+        if (e == "pdf")  { return "application/pdf" }
+        if (e == "zip")  { return "application/zip" }
+        if (e == "wasm") { return "application/wasm" }
+        return "application/octet-stream"
+    }
+
+    // Wrappers over the runtime's binary File stat (no AM File.Size yet).
+    static int FileSize(path: string) {
+        var r: int = 0
+        @c { r = (i64) File_Size((code_string) path); }
+        return r
+    }
+    static int FileMtime(path: string) {
+        var r: int = 0
+        @c { r = (i64) File_Mtime((code_string) path); }
+        return r
+    }
+
+    // Binary-safe write of the request body to `path`. Uses the raw body
+    // buffer (BodyPtr/BodyLen) when present (the H1 wire path), else the
+    // text Body (tests / non-H1).
+    static bool WriteBody(req: HttpRequest, path: string) {
+        let ptr: int = req.BodyPtr
+        let len: int = req.BodyLen
+        if (ptr == 0 || len <= 0) {
+            return File.WriteAll(path, req.Body)
+        }
+        var ok: int = 0
+        @c {
+            FILE* f = fopen((const char*) path, "wb");
+            if (f) {
+                size_t w = fwrite((const void*)(uintptr_t) ptr, 1, (size_t) len, f);
+                fclose(f);
+                ok = (w == (size_t) len) ? 1 : 0;
+            }
+        }
+        return ok != 0
+    }
+
+    // Copy a file or a whole tree (binary-safe). Directories are walked
+    // via amalgame-io-filesystem; each file is streamed through libc.
+    static bool CopyTree(srcFs: string, destFs: string) {
+        if (!Filesystem.IsDir(srcFs)) { return WebDav.CopyFile(srcFs, destFs) }
+        if (!Filesystem.MakeDir(destFs)) { return false }
+        let files: List<string> = Filesystem.ListRecursive(srcFs)
+        var i: int = 0
+        while (i < files.Count()) {
+            let relf: string = files.Get(i)
+            let s: string = srcFs + "/" + relf
+            let d: string = destFs + "/" + relf
+            let parent: string = WebDav.ParentOf(d)
+            Filesystem.MakeDir(parent)
+            if (!WebDav.CopyFile(s, d)) { return false }
+            i = i + 1
+        }
+        return true
+    }
+
+    static bool CopyFile(src: string, dst: string) {
+        var ok: int = 0
+        @c {
+            FILE* in = fopen((const char*) src, "rb");
+            if (in) {
+                FILE* out = fopen((const char*) dst, "wb");
+                if (out) {
+                    char buf[65536];
+                    size_t n;
+                    ok = 1;
+                    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+                        if (fwrite(buf, 1, n, out) != n) { ok = 0; break; }
+                    }
+                    fclose(out);
+                }
+                fclose(in);
+            }
+        }
+        return ok != 0
+    }
+}

@@ -1,0 +1,19 @@
+[package]
+name              = "amalgame-net-webdav"
+version           = "0.1.0"
+license           = "Apache-2.0"
+description       = "WebDAV server for the Mosaic stack — expose a filesystem directory over HTTP (the Apache mod_dav slice). Class 1 read/write (OPTIONS, PROPFIND, GET, HEAD, PUT, DELETE, MKCOL, COPY, MOVE) plus opt-in Class 2 locking (LOCK / UNLOCK). Binary-safe GET (via net-http File mode) and PUT (raw body buffer). Security: served root is fixed by the operator and path traversal is blocked. Directory enumeration via amalgame-io-filesystem; the handler is a pure HttpRequest -> HttpResponse dispatch, mountable on a Mosaic host or WebApp catch-all route."
+required-amalgame = ">=0.8.72"
+schema-version    = 1
+
+[dependencies]
+amalgame-net-http       = ">=0.16.0"
+amalgame-io-filesystem  = ">=0.2.0"
+amalgame-datetime       = ">=0.2.2"
+
+[stdlib]
+classes   = ["WebDav", "DavLock", "DavLockStore"]
+header    = "facade-stub.h"
+namespace = "Amalgame.Net.WebDav"
+facade    = "facade.am"
+libs      = []

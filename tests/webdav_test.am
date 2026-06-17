@@ -1,0 +1,185 @@
+// Unit tests for WebDav.Dispatch — drives the handler against a real
+// temp directory, asserting status codes, side effects on disk, and the
+// PROPFIND XML / locking behaviour. No socket: Dispatch is a pure
+// HttpRequest -> HttpResponse function.
+
+namespace Tests
+
+import Amalgame.String
+import Amalgame.Collections
+import Amalgame.Net.Http
+import Amalgame.IO.Filesystem
+import Amalgame.Net.WebDav
+
+// Tiny pass/fail accumulator (instance fields — no static mutable state).
+public class Counter {
+    public Pass:  int
+    public Total: int
+    public Counter() { this.Pass = 0; this.Total = 0 }
+    public void Ok(label: string, cond: bool) {
+        this.Total = this.Total + 1
+        if (cond) { Console.WriteLine("[PASS] " + label); this.Pass = this.Pass + 1 }
+        else      { Console.WriteLine("[FAIL] " + label) }
+    }
+}
+
+public class Program {
+    static HttpRequest req(method: string, path: string) {
+        let r = new HttpRequest()
+        r.Method = method
+        r.Path   = path
+        return r
+    }
+
+    static bool has(hay: string, needle: string) {
+        return String_IndexOf(hay, needle) >= 0
+    }
+
+    public static void Main(string[] args) {
+        Console.WriteLine("amalgame-net-webdav — WebDav.Dispatch tests")
+        let c = new Counter()
+
+        let root: string = "/tmp/amalgame-webdav-test"
+        Filesystem.Remove(root)
+        Filesystem.MakeDir(root)
+
+        let dav = WebDav.New(root, "/dav").WithLocks()
+
+        // ── OPTIONS ──────────────────────────────────────────────
+        let opt = dav.Dispatch(Program.req("OPTIONS", "/dav/"))
+        c.Ok("OPTIONS → 200 + DAV:1,2 + Allow lists PROPFIND/LOCK",
+            opt.StatusCode == 200
+            && Program.has(opt.Headers.Get("DAV"), "2")
+            && Program.has(opt.Headers.Get("Allow"), "PROPFIND")
+            && Program.has(opt.Headers.Get("Allow"), "LOCK"))
+
+        // ── PUT (create) ─────────────────────────────────────────
+        let p1 = Program.req("PUT", "/dav/hello.txt")
+        p1.Body = "hi"
+        let r1 = dav.Dispatch(p1)
+        c.Ok("PUT new file → 201 + written to disk",
+            r1.StatusCode == 201 && File.Exists(root + "/hello.txt")
+            && File.ReadAll(root + "/hello.txt") == "hi")
+
+        // ── PUT (overwrite) ──────────────────────────────────────
+        let p2 = Program.req("PUT", "/dav/hello.txt")
+        p2.Body = "yo"
+        let r2 = dav.Dispatch(p2)
+        c.Ok("PUT existing → 204 + content replaced",
+            r2.StatusCode == 204 && File.ReadAll(root + "/hello.txt") == "yo")
+
+        // ── GET / HEAD ───────────────────────────────────────────
+        let g1 = dav.Dispatch(Program.req("GET", "/dav/hello.txt"))
+        c.Ok("GET file → 200 + binary-safe File mode",
+            g1.StatusCode == 200 && g1.FilePath == root + "/hello.txt")
+        let h1 = dav.Dispatch(Program.req("HEAD", "/dav/hello.txt"))
+        c.Ok("HEAD file → 200 + no body",
+            h1.StatusCode == 200 && String_Length(h1.BodyText) == 0)
+        let g404 = dav.Dispatch(Program.req("GET", "/dav/nope.txt"))
+        c.Ok("GET missing → 404", g404.StatusCode == 404)
+
+        // ── MKCOL ────────────────────────────────────────────────
+        let mk = dav.Dispatch(Program.req("MKCOL", "/dav/sub"))
+        c.Ok("MKCOL → 201 + dir created",
+            mk.StatusCode == 201 && Filesystem.IsDir(root + "/sub"))
+        let mk2 = dav.Dispatch(Program.req("MKCOL", "/dav/sub"))
+        c.Ok("MKCOL existing → 405", mk2.StatusCode == 405)
+
+        // ── PROPFIND ─────────────────────────────────────────────
+        let pf1req = Program.req("PROPFIND", "/dav")
+        pf1req.Headers.Set("depth", "1")
+        let pf1 = dav.Dispatch(pf1req)
+        c.Ok("PROPFIND depth 1 on collection → 207 + child + collection type",
+            pf1.StatusCode == 207
+            && Program.has(pf1.BodyText, "hello.txt")
+            && Program.has(pf1.BodyText, "<D:collection/>")
+            && Program.has(pf1.BodyText, "multistatus"))
+        let pf0req = Program.req("PROPFIND", "/dav/hello.txt")
+        pf0req.Headers.Set("depth", "0")
+        let pf0 = dav.Dispatch(pf0req)
+        c.Ok("PROPFIND depth 0 on file → 207 + getcontentlength",
+            pf0.StatusCode == 207 && Program.has(pf0.BodyText, "getcontentlength"))
+
+        // ── COPY ─────────────────────────────────────────────────
+        let cpReq = Program.req("COPY", "/dav/hello.txt")
+        cpReq.Headers.Set("destination", "/dav/copy.txt")
+        let cp = dav.Dispatch(cpReq)
+        c.Ok("COPY file → 201 + both exist + content copied",
+            cp.StatusCode == 201
+            && File.Exists(root + "/hello.txt") && File.Exists(root + "/copy.txt")
+            && File.ReadAll(root + "/copy.txt") == "yo")
+
+        // ── MOVE (full-URL Destination) ──────────────────────────
+        let mvReq = Program.req("MOVE", "/dav/copy.txt")
+        mvReq.Headers.Set("destination", "http://host/dav/moved.txt")
+        let mv = dav.Dispatch(mvReq)
+        c.Ok("MOVE file (full-URL Destination) → 201 + src gone + dest present",
+            mv.StatusCode == 201
+            && !File.Exists(root + "/copy.txt") && File.Exists(root + "/moved.txt"))
+
+        // ── COPY overwrite=F onto existing → 412 ─────────────────
+        let cpF = Program.req("COPY", "/dav/hello.txt")
+        cpF.Headers.Set("destination", "/dav/moved.txt")
+        cpF.Headers.Set("overwrite", "F")
+        c.Ok("COPY onto existing with Overwrite:F → 412", dav.Dispatch(cpF).StatusCode == 412)
+
+        // ── DELETE ───────────────────────────────────────────────
+        let del = dav.Dispatch(Program.req("DELETE", "/dav/moved.txt"))
+        c.Ok("DELETE → 204 + gone",
+            del.StatusCode == 204 && !File.Exists(root + "/moved.txt"))
+        c.Ok("DELETE missing → 404", dav.Dispatch(Program.req("DELETE", "/dav/moved.txt")).StatusCode == 404)
+
+        // ── security: traversal ──────────────────────────────────
+        let trav = Program.req("PUT", "/dav/../escape.txt")
+        trav.Body = "x"
+        c.Ok("PUT with ../ traversal → 403 + nothing written outside root",
+            dav.Dispatch(trav).StatusCode == 403 && !File.Exists("/tmp/escape.txt"))
+
+        // ── unknown method ───────────────────────────────────────
+        c.Ok("unknown method → 405", dav.Dispatch(Program.req("BREW", "/dav/hello.txt")).StatusCode == 405)
+
+        // ── read-only mode ───────────────────────────────────────
+        let ro = WebDav.New(root, "/dav").ReadOnly()
+        let roPut = Program.req("PUT", "/dav/x.txt")
+        roPut.Body = "x"
+        c.Ok("read-only: PUT → 403 + not written",
+            ro.Dispatch(roPut).StatusCode == 403 && !File.Exists(root + "/x.txt"))
+        c.Ok("read-only: GET still works",
+            ro.Dispatch(Program.req("GET", "/dav/hello.txt")).StatusCode == 200)
+
+        // ── Class 2 locking ──────────────────────────────────────
+        let lk = dav.Dispatch(Program.req("LOCK", "/dav/locked.txt"))
+        let token: string = lk.Headers.Get("Lock-Token")
+        c.Ok("LOCK → 200/201 + Lock-Token + lockdiscovery body",
+            (lk.StatusCode == 200 || lk.StatusCode == 201)
+            && String_Length(token) > 0
+            && Program.has(lk.BodyText, "lockdiscovery"))
+
+        let lockedPut = Program.req("PUT", "/dav/locked.txt")
+        lockedPut.Body = "blocked"
+        c.Ok("PUT on locked resource without token → 423",
+            dav.Dispatch(lockedPut).StatusCode == 423)
+
+        let tokenPut = Program.req("PUT", "/dav/locked.txt")
+        tokenPut.Body = "allowed"
+        tokenPut.Headers.Set("if", "(" + token + ")")
+        let tokenPutR = dav.Dispatch(tokenPut)
+        c.Ok("PUT on locked resource WITH token (If header) → 2xx",
+            tokenPutR.StatusCode == 204 || tokenPutR.StatusCode == 201)
+
+        let unlock = Program.req("UNLOCK", "/dav/locked.txt")
+        unlock.Headers.Set("lock-token", token)
+        c.Ok("UNLOCK with token → 204", dav.Dispatch(unlock).StatusCode == 204)
+
+        let afterUnlock = Program.req("PUT", "/dav/locked.txt")
+        afterUnlock.Body = "free"
+        c.Ok("PUT after UNLOCK → 2xx (no longer blocked)",
+            dav.Dispatch(afterUnlock).StatusCode == 204)
+
+        // cleanup
+        Filesystem.Remove(root)
+
+        Console.WriteLine("")
+        Console.WriteLine("Summary: " + String_FromInt(c.Pass) + " passed, " + String_FromInt(c.Total - c.Pass) + " failed")
+    }
+}
