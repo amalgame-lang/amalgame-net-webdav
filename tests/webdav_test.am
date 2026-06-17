@@ -9,6 +9,8 @@ import Amalgame.String
 import Amalgame.Collections
 import Amalgame.Net.Http
 import Amalgame.IO.Filesystem
+import Amalgame.Crypto
+import Amalgame.Auth
 import Amalgame.Net.WebDav
 
 // Tiny pass/fail accumulator (instance fields — no static mutable state).
@@ -176,36 +178,61 @@ public class Program {
         c.Ok("PUT after UNLOCK → 2xx (no longer blocked)",
             dav.Dispatch(afterUnlock).StatusCode == 204)
 
-        // ── Basic auth + LAN bypass ──────────────────────────────
-        let auth = WebDav.New(root, "/dav").RequireBasicAuth("alice", "secret")
+        // ── Multi-user NAS (WebDavNas, auth via amalgame-auth) ───
+        let nas = WebDavNas.New(root + "/users", root + "/shared", "/dav").WithLocks()
+        nas.AddUser("alice", Password.Hash("alicepw"))
+        nas.AddUser("bob",   Password.Hash("bobpw"))
+        let aliceCred: string = "Basic " + BasicAuth.EncodeBase64Std("alice:alicepw")
+        let bobCred:   string = "Basic " + BasicAuth.EncodeBase64Std("bob:bobpw")
 
-        let noCreds = Program.req("GET", "/dav/hello.txt")
-        noCreds.RemoteAddr = "203.0.113.7:5000"   // public
-        let noCredsR = auth.Dispatch(noCreds)
-        c.Ok("auth: no credentials → 401 + WWW-Authenticate: Basic",
-            noCredsR.StatusCode == 401
-            && Program.has(noCredsR.Headers.Get("WWW-Authenticate"), "Basic"))
+        // anonymous → 401 + WWW-Authenticate
+        let anon = nas.Dispatch(Program.req("PROPFIND", "/dav/"))
+        c.Ok("nas: no credentials → 401 + WWW-Authenticate: Basic",
+            anon.StatusCode == 401 && Program.has(anon.Headers.Get("WWW-Authenticate"), "Basic"))
 
-        let badCreds = Program.req("GET", "/dav/hello.txt")
-        badCreds.RemoteAddr = "203.0.113.7:5000"
-        badCreds.Headers.Set("authorization", "Basic eHg6eXk=")   // "xx:yy"
-        c.Ok("auth: wrong credentials → 401", auth.Dispatch(badCreds).StatusCode == 401)
+        // wrong password → 401
+        let wrongReq = Program.req("GET", "/dav/home/")
+        wrongReq.Headers.Set("authorization", "Basic " + BasicAuth.EncodeBase64Std("alice:WRONG"))
+        c.Ok("nas: wrong password → 401", nas.Dispatch(wrongReq).StatusCode == 401)
 
-        let goodCreds = Program.req("GET", "/dav/hello.txt")
-        goodCreds.RemoteAddr = "203.0.113.7:5000"
-        goodCreds.Headers.Set("authorization", "Basic YWxpY2U6c2VjcmV0")   // "alice:secret"
-        c.Ok("auth: correct Basic credentials → 200", auth.Dispatch(goodCreds).StatusCode == 200)
+        // root PROPFIND lists home + shared
+        let rootPf = Program.req("PROPFIND", "/dav/")
+        rootPf.Headers.Set("authorization", aliceCred)
+        rootPf.Headers.Set("depth", "1")
+        let rootPfR = nas.Dispatch(rootPf)
+        c.Ok("nas: root PROPFIND → 207 + lists home & shared",
+            rootPfR.StatusCode == 207
+            && Program.has(rootPfR.BodyText, "/dav/home/")
+            && Program.has(rootPfR.BodyText, "/dav/shared/"))
 
-        // LAN bypass: private source addresses skip credentials.
-        let lanAuth = WebDav.New(root, "/dav").RequireBasicAuth("alice", "secret").AllowPrivate()
-        let lan = Program.req("GET", "/dav/hello.txt")
-        lan.RemoteAddr = "127.0.0.1:5000"
-        c.Ok("auth: LAN (loopback) bypasses credentials → 200",
-            lanAuth.Dispatch(lan).StatusCode == 200)
-        let wan = Program.req("GET", "/dav/hello.txt")
-        wan.RemoteAddr = "203.0.113.7:5000"   // public still needs creds
-        c.Ok("auth: public address still challenged with LAN bypass on → 401",
-            lanAuth.Dispatch(wan).StatusCode == 401)
+        // alice writes to her home
+        let aPut = Program.req("PUT", "/dav/home/secret.txt")
+        aPut.Headers.Set("authorization", aliceCred)
+        aPut.Body = "alice-only"
+        let aPutR = nas.Dispatch(aPut)
+        c.Ok("nas: alice PUT /home → 201 + lands in her dir",
+            aPutR.StatusCode == 201
+            && File.Exists(root + "/users/alice/secret.txt")
+            && File.ReadAll(root + "/users/alice/secret.txt") == "alice-only")
+
+        // bob cannot see alice's private file (separate home)
+        let bGet = Program.req("GET", "/dav/home/secret.txt")
+        bGet.Headers.Set("authorization", bobCred)
+        c.Ok("nas: bob GET alice's file → 404 (per-user isolation)",
+            nas.Dispatch(bGet).StatusCode == 404
+            && !File.Exists(root + "/users/bob/secret.txt"))
+
+        // shared space is visible to both
+        let aShare = Program.req("PUT", "/dav/shared/common.txt")
+        aShare.Headers.Set("authorization", aliceCred)
+        aShare.Body = "for-everyone"
+        c.Ok("nas: alice PUT /shared → 201",
+            nas.Dispatch(aShare).StatusCode == 201
+            && File.Exists(root + "/shared/common.txt"))
+        let bShare = Program.req("GET", "/dav/shared/common.txt")
+        bShare.Headers.Set("authorization", bobCred)
+        c.Ok("nas: bob GET /shared/common.txt → 200 (shared space)",
+            nas.Dispatch(bShare).StatusCode == 200)
 
         // cleanup
         Filesystem.Remove(root)

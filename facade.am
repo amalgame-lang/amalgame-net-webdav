@@ -32,6 +32,7 @@ import Amalgame.String
 import Amalgame.Net.Http
 import Amalgame.IO.Filesystem
 import Amalgame.DateTime
+import Amalgame.Auth
 
 @c {
     #include <stdio.h>
@@ -134,20 +135,11 @@ public class WebDav {
     public Writable:     bool          // mutating verbs allowed
     public LocksEnabled: bool          // Class 2 LOCK/UNLOCK on
     public Locks:        DavLockStore
-    // Access control (HTTP Basic — the WebDAV-native scheme, works with
-    // Android/Finder/Windows/davfs2/curl). Off by default.
-    public AuthEnabled:  bool
-    public AuthUser:     string
-    public AuthPass:     string
-    public AuthRealm:    string
-    public AllowPrivate: bool          // loopback/RFC1918/ULA bypass creds (LAN)
 
     public WebDav() {
         this.Root = ""; this.Prefix = ""
         this.Writable = true; this.LocksEnabled = false
         this.Locks = new DavLockStore()
-        this.AuthEnabled = false; this.AuthUser = ""; this.AuthPass = ""
-        this.AuthRealm = "WebDAV"; this.AllowPrivate = false
     }
 
     // root: filesystem directory to expose. prefix: URL path it lives at
@@ -161,29 +153,14 @@ public class WebDav {
 
     public WebDav ReadOnly()  { this.Writable = false;     return this }
     public WebDav WithLocks() { this.LocksEnabled = true;  return this }
-
-    // Require HTTP Basic credentials (the WebDAV-native auth scheme —
-    // works with Android WebDAV apps, Finder, Windows Explorer, davfs2,
-    // rclone, curl). ALWAYS deploy this behind TLS (the Mosaic HTTPS
-    // host): Basic sends the password base64-encoded, not encrypted.
-    public WebDav RequireBasicAuth(user: string, pass: string) {
-        this.AuthEnabled = true
-        this.AuthUser = user
-        this.AuthPass = pass
-        return this
-    }
-    public WebDav Realm(r: string)  { this.AuthRealm = r;       return this }
-    // Let loopback / RFC1918 / ULA clients through WITHOUT credentials
-    // (convenient on a trusted LAN; remote clients still need Basic).
-    public WebDav AllowPrivate()    { this.AllowPrivate = true; return this }
+    // NOTE: WebDav is auth-agnostic. To require credentials, wrap with
+    // amalgame-auth's BasicAuth in front of Dispatch (or use WebDavNas
+    // for a multi-user share). This keeps the engine free of the
+    // framework's auth dependency.
 
     // ── main dispatch ──────────────────────────────────────────────
     public HttpResponse Dispatch(req: HttpRequest) {
         let m: string = req.Method
-
-        // Access control first — unauthenticated callers never reach the
-        // filesystem.
-        if (!this.Authorized(req)) { return this.Unauthorized() }
 
         let raw: string = this.StripPrefix(req.Path)
         if (WebDav.HasTraversal(raw)) { return WebDav.Empty(403) }
@@ -452,25 +429,6 @@ public class WebDav {
         return true
     }
 
-    // ── access control (HTTP Basic + optional LAN bypass) ──────────
-    bool Authorized(req: HttpRequest) {
-        if (!this.AuthEnabled) { return true }
-        // Trusted-LAN bypass: loopback / RFC1918 / ULA without creds.
-        if (this.AllowPrivate && WebDav.IsPrivateAddr(req.RemoteAddr)) { return true }
-        let h: string = req.Header("authorization")
-        if (!String_StartsWith(h, "Basic ")) { return false }
-        let b64: string = String_Trim(String_Substring(h, 6, String_Length(h) - 6))
-        let want: string = this.AuthUser + ":" + this.AuthPass
-        return WebDav.B64Decode(b64) == want
-    }
-
-    HttpResponse Unauthorized() {
-        let r = HttpResponse.New().Status(401)
-        r.Header("WWW-Authenticate", "Basic realm=\"" + this.AuthRealm + "\"")
-        r.Header("Content-Length", "0")
-        return r
-    }
-
     // ── path mapping helpers ───────────────────────────────────────
     string StripPrefix(path: string) {
         var p: string = path
@@ -530,6 +488,13 @@ public class WebDav {
     static string JoinRel(rel: string, name: string) {
         if (String_Length(rel) == 0) { return name }
         return rel + "/" + name
+    }
+
+    // First path segment of a cleaned rel ("home/x/y" → "home").
+    static string FirstSeg(p: string) {
+        let i: int = String_IndexOf(p, "/")
+        if (i < 0) { return p }
+        return String_Substring(p, 0, i)
     }
 
     static bool IsWriteMethod(m: string) {
@@ -669,60 +634,6 @@ public class WebDav {
         return r
     }
 
-    // Standard base64 decode (for the Basic credentials). Skips non-table
-    // chars, stops at "=" padding. Credentials are text, so the
-    // NUL-terminated result is fine.
-    static string B64Decode(s: string) {
-        var out: string = ""
-        @c {
-            const char* in = (const char*) s;
-            int n = (int) strlen(in);
-            int T[256]; int ti;
-            for (ti = 0; ti < 256; ti++) T[ti] = -1;
-            const char* A = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-            for (ti = 0; ti < 64; ti++) T[(unsigned char) A[ti]] = ti;
-            char* o = (char*) GC_MALLOC((size_t) n + 1);
-            int oi = 0, val = 0, bits = -8, i;
-            for (i = 0; i < n; i++) {
-                unsigned char ch = (unsigned char) in[i];
-                if (ch == '=') break;
-                int d = T[ch];
-                if (d < 0) continue;
-                val = (val << 6) | d; bits += 6;
-                if (bits >= 0) { o[oi++] = (char) ((val >> bits) & 0xFF); bits -= 8; }
-            }
-            o[oi] = '\0';
-            out = (code_string) o;
-        }
-        return out
-    }
-
-    // Loopback / RFC1918 / link-local / ULA on an "ip" or "ip:port"
-    // string. Fail-closed: anything not positively private → false (so
-    // the caller must present credentials). Mirrors amalgame-web's
-    // Observability.isPrivateAddr (the /metrics private-by-default gate).
-    static bool IsPrivateAddr(addr: string) {
-        if (String_Length(addr) == 0) { return false }
-        if (String_StartsWith(addr, "::1"))     { return true }
-        if (String_StartsWith(addr, "[::1]"))   { return true }
-        if (String_StartsWith(addr, "fc"))      { return true }
-        if (String_StartsWith(addr, "fd"))      { return true }
-        if (String_StartsWith(addr, "[fc"))     { return true }
-        if (String_StartsWith(addr, "[fd"))     { return true }
-        if (String_StartsWith(addr, "fe80"))    { return true }
-        if (String_StartsWith(addr, "[fe80"))   { return true }
-        if (String_StartsWith(addr, "127."))    { return true }
-        if (String_StartsWith(addr, "10."))     { return true }
-        if (String_StartsWith(addr, "192.168.")){ return true }
-        if (String_StartsWith(addr, "169.254.")){ return true }
-        var k: int = 16
-        while (k <= 31) {
-            if (String_StartsWith(addr, "172." + String_FromInt(k) + ".")) { return true }
-            k = k + 1
-        }
-        return false
-    }
-
     static string MimeOf(path: string) {
         let i: int = WebDav.LastIndexOf(path, ".")
         if (i < 0) { return "application/octet-stream" }
@@ -814,5 +725,157 @@ public class WebDav {
             }
         }
         return ok != 0
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+//  Multi-user NAS layer — each authenticated user gets a private /home
+//  space plus a common /shared space, like a small NAS.
+// ─────────────────────────────────────────────────────────────────────
+
+// WebDavNas — mounts a per-user home and a shared space under one prefix.
+//
+//   import Amalgame.Net.WebDav
+//
+//   let nas = WebDavNas.New("/srv/users", "/srv/shared", "/dav").WithLocks()
+//   nas.AddUser("alice", Password.Hash("…"))   // scrypt hash (crypto)
+//   nas.AddUser("bob",   bobHash)
+//   let resp = nas.Dispatch(req)
+//
+// URL layout (every request is HTTP-Basic-authenticated against the user
+// store; no valid login → 401):
+//   /<prefix>/            → a collection listing { home, shared }
+//   /<prefix>/home/...    → the AUTHENTICATED user's own space
+//                           (/srv/users/<user>/...), isolated per user
+//   /<prefix>/shared/...  → the common space (/srv/shared/...)
+//
+// Each space is served by a cached single-root WebDav engine (so locks
+// persist), reusing all of its verb logic and binary-safety. Deploy
+// behind TLS — Basic sends the password base64-encoded, not encrypted.
+public class WebDavNas {
+    public Prefix:       string
+    public UsersDir:     string        // base dir; home = UsersDir/<user>
+    public SharedDir:    string
+    public Creds:        Credentials   // amalgame-auth multi-user store
+    public Auth:         BasicAuth      // amalgame-auth Basic middleware
+    public Writable:     bool
+    public LocksEnabled: bool
+    public HomeCache:    Map<string, WebDav>   // user → engine (persistent locks)
+    public SharedInst:   WebDav
+    public SharedReady:  bool
+
+    public WebDavNas() {
+        this.Prefix = ""; this.UsersDir = ""; this.SharedDir = ""
+        this.Creds = new Credentials()
+        this.Auth  = BasicAuth.ForCredentials("Family NAS", this.Creds)
+        this.Writable = true; this.LocksEnabled = false
+        this.HomeCache = new Map<string, WebDav>()
+        this.SharedInst = null; this.SharedReady = false
+    }
+
+    public static WebDavNas New(usersDir: string, sharedDir: string, prefix: string) {
+        let n = new WebDavNas()
+        n.UsersDir  = WebDav.TrimTrailingSlash(usersDir)
+        n.SharedDir = WebDav.TrimTrailingSlash(sharedDir)
+        n.Prefix    = WebDav.TrimTrailingSlash(prefix)
+        return n
+    }
+
+    public WebDavNas ReadOnly()              { this.Writable = false;    return this }
+    public WebDavNas WithLocks()             { this.LocksEnabled = true; return this }
+    public WebDavNas Realm(r: string)        { this.Auth.Realm = r;      return this }
+    // Register a family member: name + scrypt password hash (crypto's
+    // Password.Hash — kept in a config file / KeePass, never in clear).
+    public WebDavNas AddUser(name: string, passHash: string) {
+        this.Creds.Add(name, passHash)
+        return this
+    }
+
+    public HttpResponse Dispatch(req: HttpRequest) {
+        let user: string = this.Auth.Authenticate(req)
+        if (String_Length(user) == 0) { return this.Auth.Challenge() }
+
+        var raw: string = req.Path
+        let pl: int = String_Length(this.Prefix)
+        if (pl > 0 && String_StartsWith(raw, this.Prefix)) {
+            raw = String_Substring(raw, pl, String_Length(raw) - pl)
+        }
+        if (WebDav.HasTraversal(raw)) { return WebDav.Empty(403) }
+        let rel: string = WebDav.CleanRel(raw)
+
+        if (String_Length(rel) == 0) { return this.RootDispatch(req) }
+
+        let seg: string = WebDav.FirstSeg(rel)
+        if (seg == "shared") { return this.SharedInstance().Dispatch(req) }
+        if (seg == "home")   { return this.HomeInstance(user).Dispatch(req) }
+        return WebDav.Empty(404)
+    }
+
+    // Per-user engine (created once, cached → locks persist). The user's
+    // home directory is created on first access.
+    WebDav HomeInstance(user: string) {
+        if (this.HomeCache.Has(user)) { return this.HomeCache.Get(user) }
+        let root: string = this.UsersDir + "/" + user
+        Filesystem.MakeDir(root)
+        let w = WebDav.New(root, this.Prefix + "/home")
+        if (!this.Writable)     { w.ReadOnly() }
+        if (this.LocksEnabled)  { w.WithLocks() }
+        this.HomeCache.Set(user, w)
+        return w
+    }
+
+    WebDav SharedInstance() {
+        if (this.SharedReady) { return this.SharedInst }
+        Filesystem.MakeDir(this.SharedDir)
+        let w = WebDav.New(this.SharedDir, this.Prefix + "/shared")
+        if (!this.Writable)     { w.ReadOnly() }
+        if (this.LocksEnabled)  { w.WithLocks() }
+        this.SharedInst = w; this.SharedReady = true
+        return w
+    }
+
+    // The synthetic root (/<prefix>/): advertise + list the two spaces.
+    HttpResponse RootDispatch(req: HttpRequest) {
+        let m: string = req.Method
+        if (m == "OPTIONS") {
+            var dav: string = "1"
+            if (this.LocksEnabled) { dav = "1, 2" }
+            let r = HttpResponse.New().Status(200)
+            r.Header("DAV", dav)
+            r.Header("Allow", "OPTIONS, PROPFIND, GET, HEAD")
+            r.Header("MS-Author-Via", "DAV")
+            r.Header("Content-Length", "0")
+            return r
+        }
+        if (m == "PROPFIND") {
+            let depth: string = req.Header("depth")
+            var body: string = WebDav.XmlHead() + "<D:multistatus xmlns:D=\"DAV:\">"
+            body = body + WebDavNas.Coll(this.Prefix + "/", "/")
+            if (depth != "0") {
+                body = body + WebDavNas.Coll(this.Prefix + "/home/", "home")
+                body = body + WebDavNas.Coll(this.Prefix + "/shared/", "shared")
+            }
+            body = body + "</D:multistatus>"
+            let r = HttpResponse.New().Status(207)
+            r.Header("Content-Type", "application/xml; charset=utf-8")
+            r.BodyText = body
+            return r
+        }
+        if (m == "GET" || m == "HEAD") {
+            let r = HttpResponse.New().Status(200)
+            r.Header("Content-Type", "text/plain; charset=utf-8")
+            if (m == "GET") { r.BodyText = "home\nshared\n" }
+            return r
+        }
+        return WebDav.Empty(405)
+    }
+
+    static string Coll(href: string, name: string) {
+        var x: string = "<D:response><D:href>" + WebDav.XmlEscape(href) + "</D:href>"
+        x = x + "<D:propstat><D:prop>"
+        x = x + "<D:displayname>" + WebDav.XmlEscape(name) + "</D:displayname>"
+        x = x + "<D:resourcetype><D:collection/></D:resourcetype>"
+        x = x + "</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>"
+        return x
     }
 }
