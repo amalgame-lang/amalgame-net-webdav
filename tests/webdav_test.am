@@ -234,6 +234,50 @@ public class Program {
         c.Ok("nas: bob GET /shared/common.txt → 200 (shared space)",
             nas.Dispatch(bShare).StatusCode == 200)
 
+        // ── Admin role: /all/<user> (parents over children) ─────
+        let nas2 = WebDavNas.New(root + "/users", root + "/shared", "/dav").WithLocks()
+        nas2.AddAdmin("dad", Password.Hash("dadpw"))
+        nas2.AddUser("kid", Password.Hash("kidpw"))
+        let dadCred: string = "Basic " + BasicAuth.EncodeBase64Std("dad:dadpw")
+        let kidCred: string = "Basic " + BasicAuth.EncodeBase64Std("kid:kidpw")
+
+        // kid writes a private file in her own home
+        let kPut = Program.req("PUT", "/dav/home/diary.txt")
+        kPut.Headers.Set("authorization", kidCred)
+        kPut.Body = "kid-secret"
+        nas2.Dispatch(kPut)
+
+        // admin sees /all in the root listing
+        let dRoot = Program.req("PROPFIND", "/dav/")
+        dRoot.Headers.Set("authorization", dadCred)
+        dRoot.Headers.Set("depth", "1")
+        c.Ok("nas admin: root PROPFIND lists /all",
+            Program.has(nas2.Dispatch(dRoot).BodyText, "/dav/all/"))
+
+        // admin reads the kid's private file via /all/kid
+        let dGet = Program.req("GET", "/dav/all/kid/diary.txt")
+        dGet.Headers.Set("authorization", dadCred)
+        let dGetR = nas2.Dispatch(dGet)
+        c.Ok("nas admin: dad reads kid's file via /all/kid → 200",
+            dGetR.StatusCode == 200 && dGetR.FilePath == root + "/users/kid/diary.txt")
+
+        // admin writes into the kid's home via /all (read/write)
+        let dPut = Program.req("PUT", "/dav/all/kid/note.txt")
+        dPut.Headers.Set("authorization", dadCred)
+        dPut.Body = "from-dad"
+        c.Ok("nas admin: dad PUT into kid's home via /all → 201",
+            nas2.Dispatch(dPut).StatusCode == 201
+            && File.Exists(root + "/users/kid/note.txt"))
+
+        // a NON-admin cannot use /all (hidden → 404)
+        let kAll = Program.req("PROPFIND", "/dav/all/")
+        kAll.Headers.Set("authorization", kidCred)
+        kAll.Headers.Set("depth", "1")
+        c.Ok("nas: non-admin /all → 404 (hidden)", nas2.Dispatch(kAll).StatusCode == 404)
+        let kAll2 = Program.req("GET", "/dav/all/dad/")
+        kAll2.Headers.Set("authorization", kidCred)
+        c.Ok("nas: non-admin /all/<other> → 404", nas2.Dispatch(kAll2).StatusCode == 404)
+
         // cleanup
         Filesystem.Remove(root)
 

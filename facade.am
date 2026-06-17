@@ -763,6 +763,8 @@ public class WebDavNas {
     public HomeCache:    Map<string, WebDav>   // user → engine (persistent locks)
     public SharedInst:   WebDav
     public SharedReady:  bool
+    public Admins:       Map<string, bool>     // admin usernames (see all homes)
+    public AllCache:     Map<string, WebDav>   // target → /all/<target> engine
 
     public WebDavNas() {
         this.Prefix = ""; this.UsersDir = ""; this.SharedDir = ""
@@ -771,6 +773,8 @@ public class WebDavNas {
         this.Writable = true; this.LocksEnabled = false
         this.HomeCache = new Map<string, WebDav>()
         this.SharedInst = null; this.SharedReady = false
+        this.Admins = new Map<string, bool>()
+        this.AllCache = new Map<string, WebDav>()
     }
 
     public static WebDavNas New(usersDir: string, sharedDir: string, prefix: string) {
@@ -790,6 +794,14 @@ public class WebDavNas {
         this.Creds.Add(name, passHash)
         return this
     }
+    // An admin additionally reaches every user's home under /all/<user>
+    // (read/write) — e.g. parents over their children's spaces.
+    public WebDavNas AddAdmin(name: string, passHash: string) {
+        this.Creds.Add(name, passHash)
+        this.Admins.Set(name, true)
+        return this
+    }
+    bool IsAdmin(user: string) { return this.Admins.Has(user) }
 
     public HttpResponse Dispatch(req: HttpRequest) {
         let user: string = this.Auth.Authenticate(req)
@@ -803,11 +815,21 @@ public class WebDavNas {
         if (WebDav.HasTraversal(raw)) { return WebDav.Empty(403) }
         let rel: string = WebDav.CleanRel(raw)
 
-        if (String_Length(rel) == 0) { return this.RootDispatch(req) }
+        if (String_Length(rel) == 0) { return this.RootDispatch(req, user) }
 
         let seg: string = WebDav.FirstSeg(rel)
         if (seg == "shared") { return this.SharedInstance().Dispatch(req) }
         if (seg == "home")   { return this.HomeInstance(user).Dispatch(req) }
+        // Admin-only: /all (list every user) and /all/<target>/… (that
+        // user's home, read/write). Hidden (404) from non-admins.
+        if (seg == "all") {
+            if (!this.IsAdmin(user)) { return WebDav.Empty(404) }
+            let rest: string = WebDav.CleanRel(String_Substring(rel, 3, String_Length(rel) - 3))
+            if (String_Length(rest) == 0) { return this.AllRootDispatch(req) }
+            let target: string = WebDav.FirstSeg(rest)
+            if (!this.Creds.Has(target)) { return WebDav.Empty(404) }
+            return this.AllInstance(target).Dispatch(req)
+        }
         return WebDav.Empty(404)
     }
 
@@ -834,9 +856,23 @@ public class WebDavNas {
         return w
     }
 
-    // The synthetic root (/<prefix>/): advertise + list the two spaces.
-    HttpResponse RootDispatch(req: HttpRequest) {
+    // Admin view of a target user's home, mounted at /all/<target>.
+    WebDav AllInstance(target: string) {
+        if (this.AllCache.Has(target)) { return this.AllCache.Get(target) }
+        let root: string = this.UsersDir + "/" + target
+        Filesystem.MakeDir(root)
+        let w = WebDav.New(root, this.Prefix + "/all/" + target)
+        if (!this.Writable)     { w.ReadOnly() }
+        if (this.LocksEnabled)  { w.WithLocks() }
+        this.AllCache.Set(target, w)
+        return w
+    }
+
+    // The synthetic root (/<prefix>/): advertise + list the spaces. An
+    // admin also sees /all.
+    HttpResponse RootDispatch(req: HttpRequest, user: string) {
         let m: string = req.Method
+        let admin: bool = this.IsAdmin(user)
         if (m == "OPTIONS") {
             var dav: string = "1"
             if (this.LocksEnabled) { dav = "1, 2" }
@@ -854,6 +890,7 @@ public class WebDavNas {
             if (depth != "0") {
                 body = body + WebDavNas.Coll(this.Prefix + "/home/", "home")
                 body = body + WebDavNas.Coll(this.Prefix + "/shared/", "shared")
+                if (admin) { body = body + WebDavNas.Coll(this.Prefix + "/all/", "all") }
             }
             body = body + "</D:multistatus>"
             let r = HttpResponse.New().Status(207)
@@ -864,7 +901,48 @@ public class WebDavNas {
         if (m == "GET" || m == "HEAD") {
             let r = HttpResponse.New().Status(200)
             r.Header("Content-Type", "text/plain; charset=utf-8")
-            if (m == "GET") { r.BodyText = "home\nshared\n" }
+            if (m == "GET") {
+                var b: string = "home\nshared\n"
+                if (admin) { b = b + "all\n" }
+                r.BodyText = b
+            }
+            return r
+        }
+        return WebDav.Empty(405)
+    }
+
+    // The /all collection (admin): list every user's home as a child.
+    HttpResponse AllRootDispatch(req: HttpRequest) {
+        let m: string = req.Method
+        if (m == "PROPFIND") {
+            let depth: string = req.Header("depth")
+            var body: string = WebDav.XmlHead() + "<D:multistatus xmlns:D=\"DAV:\">"
+            body = body + WebDavNas.Coll(this.Prefix + "/all/", "all")
+            if (depth != "0") {
+                let names: List<string> = Filesystem.List(this.UsersDir)
+                var i: int = 0
+                while (i < names.Count()) {
+                    let nm: string = names.Get(i)
+                    body = body + WebDavNas.Coll(this.Prefix + "/all/" + nm + "/", nm)
+                    i = i + 1
+                }
+            }
+            body = body + "</D:multistatus>"
+            let r = HttpResponse.New().Status(207)
+            r.Header("Content-Type", "application/xml; charset=utf-8")
+            r.BodyText = body
+            return r
+        }
+        if (m == "GET" || m == "HEAD") {
+            let r = HttpResponse.New().Status(200)
+            r.Header("Content-Type", "text/plain; charset=utf-8")
+            if (m == "GET") {
+                var b: string = ""
+                let names: List<string> = Filesystem.List(this.UsersDir)
+                var i: int = 0
+                while (i < names.Count()) { b = b + names.Get(i) + "\n"; i = i + 1 }
+                r.BodyText = b
+            }
             return r
         }
         return WebDav.Empty(405)
