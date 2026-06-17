@@ -176,6 +176,37 @@ public class Program {
         c.Ok("PUT after UNLOCK → 2xx (no longer blocked)",
             dav.Dispatch(afterUnlock).StatusCode == 204)
 
+        // ── Basic auth + LAN bypass ──────────────────────────────
+        let auth = WebDav.New(root, "/dav").RequireBasicAuth("alice", "secret")
+
+        let noCreds = Program.req("GET", "/dav/hello.txt")
+        noCreds.RemoteAddr = "203.0.113.7:5000"   // public
+        let noCredsR = auth.Dispatch(noCreds)
+        c.Ok("auth: no credentials → 401 + WWW-Authenticate: Basic",
+            noCredsR.StatusCode == 401
+            && Program.has(noCredsR.Headers.Get("WWW-Authenticate"), "Basic"))
+
+        let badCreds = Program.req("GET", "/dav/hello.txt")
+        badCreds.RemoteAddr = "203.0.113.7:5000"
+        badCreds.Headers.Set("authorization", "Basic eHg6eXk=")   // "xx:yy"
+        c.Ok("auth: wrong credentials → 401", auth.Dispatch(badCreds).StatusCode == 401)
+
+        let goodCreds = Program.req("GET", "/dav/hello.txt")
+        goodCreds.RemoteAddr = "203.0.113.7:5000"
+        goodCreds.Headers.Set("authorization", "Basic YWxpY2U6c2VjcmV0")   // "alice:secret"
+        c.Ok("auth: correct Basic credentials → 200", auth.Dispatch(goodCreds).StatusCode == 200)
+
+        // LAN bypass: private source addresses skip credentials.
+        let lanAuth = WebDav.New(root, "/dav").RequireBasicAuth("alice", "secret").AllowPrivate()
+        let lan = Program.req("GET", "/dav/hello.txt")
+        lan.RemoteAddr = "127.0.0.1:5000"
+        c.Ok("auth: LAN (loopback) bypasses credentials → 200",
+            lanAuth.Dispatch(lan).StatusCode == 200)
+        let wan = Program.req("GET", "/dav/hello.txt")
+        wan.RemoteAddr = "203.0.113.7:5000"   // public still needs creds
+        c.Ok("auth: public address still challenged with LAN bypass on → 401",
+            lanAuth.Dispatch(wan).StatusCode == 401)
+
         // cleanup
         Filesystem.Remove(root)
 

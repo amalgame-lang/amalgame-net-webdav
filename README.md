@@ -9,8 +9,12 @@ network drive: macOS Finder, Windows Explorer, GNOME Files, `cadaver`,
 ```amalgame
 import Amalgame.Net.WebDav
 
-// serve /srv/share at the URL prefix /dav, with locking on
-let dav = WebDav.New("/srv/share", "/dav").WithLocks()
+// serve /srv/share at the URL prefix /dav: password-protected, with
+// locking, and tokenless access from the LAN
+let dav = WebDav.New("/srv/share", "/dav")
+    .RequireBasicAuth("alice", "s3cret")   // HTTP Basic (deploy behind TLS)
+    .AllowPrivate()                         // loopback/RFC1918 skip creds
+    .WithLocks()
 
 // the handler is a pure HttpRequest -> HttpResponse function
 let resp = dav.Dispatch(req)
@@ -37,8 +41,36 @@ and it is unit-testable without opening a socket.
 | `LOCK` / `UNLOCK` | exclusive write locks (opt-in, `WithLocks()`) — Class 2 |
 | `PROPPATCH` | `207` (property persistence is a tracked follow-up) |
 
+## Authentication
+
+`.RequireBasicAuth(user, pass)` gates every request: a caller without
+valid credentials gets `401` + `WWW-Authenticate: Basic realm="…"` and
+never reaches the filesystem. HTTP Basic is the **WebDAV-native** scheme,
+so it works with essentially every client — Android WebDAV apps
+(Solid Explorer, CX File Explorer, FolderSync, RaiDrive, DavX5, …),
+macOS Finder, Windows Explorer, `davfs2`, `rclone`, and `curl -u`.
+
+```amalgame
+WebDav.New("/srv/share", "/dav")
+    .RequireBasicAuth("alice", "s3cret")   // challenge everyone…
+    .AllowPrivate()                         // …except loopback/RFC1918/ULA (LAN)
+    .Realm("My Files")                      // optional realm string
+```
+
+> **Deploy behind TLS.** Basic sends the password base64-encoded, *not*
+> encrypted. Terminate HTTPS at the Mosaic host (ACME/Let's Encrypt) so
+> credentials and file contents are never sent in clear. Over the public
+> internet, always use `https://`.
+
+`.AllowPrivate()` is the convenience for a trusted home/office LAN: a
+phone on the same Wi-Fi (a private source address) browses without a
+password, while anything off-LAN is still challenged. Leave it off to
+require credentials from every address.
+
 ## Security — wired in by default
 
+- **Auth fails closed.** With `.RequireBasicAuth(...)`, no/invalid
+  credentials → `401`, checked *before* any path handling.
 - **No path traversal.** The served root is fixed by the operator and
   never derived from client input; the URL prefix is stripped and any
   `..` segment is rejected with `403` *before* a path touches the disk —
@@ -61,8 +93,11 @@ and it is unit-testable without opening a socket.
 
 ```amalgame
 WebDav.New(root: string, prefix: string) : WebDav
-  .ReadOnly()        // reject all mutating verbs (default: writable)
-  .WithLocks()       // enable Class 2 LOCK / UNLOCK + 423 enforcement
+  .RequireBasicAuth(user, pass)  // HTTP Basic; 401 if missing/invalid
+  .AllowPrivate()                // loopback/RFC1918/ULA skip credentials
+  .Realm(name)                   // WWW-Authenticate realm (default "WebDAV")
+  .ReadOnly()                    // reject all mutating verbs (default: writable)
+  .WithLocks()                   // enable Class 2 LOCK / UNLOCK + 423 enforcement
   .Dispatch(req: HttpRequest) : HttpResponse
 ```
 
@@ -72,7 +107,7 @@ WebDav.New(root: string, prefix: string) : WebDav
 - `amalgame-io-filesystem` — directory enumeration + recursive ops
 - `amalgame-datetime`      — RFC 1123 `getlastmodified`
 
-## Limitations (v0.1.0 — honest scope)
+## Limitations (v0.2.0 — honest scope)
 
 - **PROPFIND** returns a fixed, useful property set; an explicit `<prop>`
   request list isn't parsed (extra properties are tolerated by clients),
@@ -85,11 +120,15 @@ WebDav.New(root: string, prefix: string) : WebDav
 - **COPY** of a tree recreates files and their parent directories;
   empty sub-directories are not copied.
 - `MOVE` is a `rename(2)` — cross-volume moves return `409`.
+- **Auth is single-user HTTP Basic** (one `user`/`pass`); no Digest, no
+  per-user accounts, and the comparison is a plain string equality. For
+  multi-user / token / OIDC, mount behind the `amalgame-web` auth
+  middleware instead. Always run over TLS.
 
 ## Build & test
 
 ```bash
-./tests/run_tests.sh        # 24 checks: every verb, traversal, RO, locks
+./tests/run_tests.sh        # 29 checks: every verb, traversal, RO, locks, auth
 ```
 
 The runner resolves sibling checkouts of `amalgame-net-http`,

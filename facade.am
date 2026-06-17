@@ -134,11 +134,20 @@ public class WebDav {
     public Writable:     bool          // mutating verbs allowed
     public LocksEnabled: bool          // Class 2 LOCK/UNLOCK on
     public Locks:        DavLockStore
+    // Access control (HTTP Basic — the WebDAV-native scheme, works with
+    // Android/Finder/Windows/davfs2/curl). Off by default.
+    public AuthEnabled:  bool
+    public AuthUser:     string
+    public AuthPass:     string
+    public AuthRealm:    string
+    public AllowPrivate: bool          // loopback/RFC1918/ULA bypass creds (LAN)
 
     public WebDav() {
         this.Root = ""; this.Prefix = ""
         this.Writable = true; this.LocksEnabled = false
         this.Locks = new DavLockStore()
+        this.AuthEnabled = false; this.AuthUser = ""; this.AuthPass = ""
+        this.AuthRealm = "WebDAV"; this.AllowPrivate = false
     }
 
     // root: filesystem directory to expose. prefix: URL path it lives at
@@ -153,9 +162,28 @@ public class WebDav {
     public WebDav ReadOnly()  { this.Writable = false;     return this }
     public WebDav WithLocks() { this.LocksEnabled = true;  return this }
 
+    // Require HTTP Basic credentials (the WebDAV-native auth scheme —
+    // works with Android WebDAV apps, Finder, Windows Explorer, davfs2,
+    // rclone, curl). ALWAYS deploy this behind TLS (the Mosaic HTTPS
+    // host): Basic sends the password base64-encoded, not encrypted.
+    public WebDav RequireBasicAuth(user: string, pass: string) {
+        this.AuthEnabled = true
+        this.AuthUser = user
+        this.AuthPass = pass
+        return this
+    }
+    public WebDav Realm(r: string)  { this.AuthRealm = r;       return this }
+    // Let loopback / RFC1918 / ULA clients through WITHOUT credentials
+    // (convenient on a trusted LAN; remote clients still need Basic).
+    public WebDav AllowPrivate()    { this.AllowPrivate = true; return this }
+
     // ── main dispatch ──────────────────────────────────────────────
     public HttpResponse Dispatch(req: HttpRequest) {
         let m: string = req.Method
+
+        // Access control first — unauthenticated callers never reach the
+        // filesystem.
+        if (!this.Authorized(req)) { return this.Unauthorized() }
 
         let raw: string = this.StripPrefix(req.Path)
         if (WebDav.HasTraversal(raw)) { return WebDav.Empty(403) }
@@ -424,6 +452,25 @@ public class WebDav {
         return true
     }
 
+    // ── access control (HTTP Basic + optional LAN bypass) ──────────
+    bool Authorized(req: HttpRequest) {
+        if (!this.AuthEnabled) { return true }
+        // Trusted-LAN bypass: loopback / RFC1918 / ULA without creds.
+        if (this.AllowPrivate && WebDav.IsPrivateAddr(req.RemoteAddr)) { return true }
+        let h: string = req.Header("authorization")
+        if (!String_StartsWith(h, "Basic ")) { return false }
+        let b64: string = String_Trim(String_Substring(h, 6, String_Length(h) - 6))
+        let want: string = this.AuthUser + ":" + this.AuthPass
+        return WebDav.B64Decode(b64) == want
+    }
+
+    HttpResponse Unauthorized() {
+        let r = HttpResponse.New().Status(401)
+        r.Header("WWW-Authenticate", "Basic realm=\"" + this.AuthRealm + "\"")
+        r.Header("Content-Length", "0")
+        return r
+    }
+
     // ── path mapping helpers ───────────────────────────────────────
     string StripPrefix(path: string) {
         var p: string = path
@@ -620,6 +667,60 @@ public class WebDav {
         let r = HttpResponse.New().Status(code)
         r.Header("Content-Length", "0")
         return r
+    }
+
+    // Standard base64 decode (for the Basic credentials). Skips non-table
+    // chars, stops at "=" padding. Credentials are text, so the
+    // NUL-terminated result is fine.
+    static string B64Decode(s: string) {
+        var out: string = ""
+        @c {
+            const char* in = (const char*) s;
+            int n = (int) strlen(in);
+            int T[256]; int ti;
+            for (ti = 0; ti < 256; ti++) T[ti] = -1;
+            const char* A = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            for (ti = 0; ti < 64; ti++) T[(unsigned char) A[ti]] = ti;
+            char* o = (char*) GC_MALLOC((size_t) n + 1);
+            int oi = 0, val = 0, bits = -8, i;
+            for (i = 0; i < n; i++) {
+                unsigned char ch = (unsigned char) in[i];
+                if (ch == '=') break;
+                int d = T[ch];
+                if (d < 0) continue;
+                val = (val << 6) | d; bits += 6;
+                if (bits >= 0) { o[oi++] = (char) ((val >> bits) & 0xFF); bits -= 8; }
+            }
+            o[oi] = '\0';
+            out = (code_string) o;
+        }
+        return out
+    }
+
+    // Loopback / RFC1918 / link-local / ULA on an "ip" or "ip:port"
+    // string. Fail-closed: anything not positively private → false (so
+    // the caller must present credentials). Mirrors amalgame-web's
+    // Observability.isPrivateAddr (the /metrics private-by-default gate).
+    static bool IsPrivateAddr(addr: string) {
+        if (String_Length(addr) == 0) { return false }
+        if (String_StartsWith(addr, "::1"))     { return true }
+        if (String_StartsWith(addr, "[::1]"))   { return true }
+        if (String_StartsWith(addr, "fc"))      { return true }
+        if (String_StartsWith(addr, "fd"))      { return true }
+        if (String_StartsWith(addr, "[fc"))     { return true }
+        if (String_StartsWith(addr, "[fd"))     { return true }
+        if (String_StartsWith(addr, "fe80"))    { return true }
+        if (String_StartsWith(addr, "[fe80"))   { return true }
+        if (String_StartsWith(addr, "127."))    { return true }
+        if (String_StartsWith(addr, "10."))     { return true }
+        if (String_StartsWith(addr, "192.168.")){ return true }
+        if (String_StartsWith(addr, "169.254.")){ return true }
+        var k: int = 16
+        while (k <= 31) {
+            if (String_StartsWith(addr, "172." + String_FromInt(k) + ".")) { return true }
+            k = k + 1
+        }
+        return false
     }
 
     static string MimeOf(path: string) {
