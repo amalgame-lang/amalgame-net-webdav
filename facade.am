@@ -444,13 +444,16 @@ public class WebDav {
         return this.Root + "/" + rel
     }
 
-    // URL href for a resource (collections get a trailing slash).
+    // URL href for a resource (collections get a trailing slash). The
+    // relative path is percent-encoded (RFC 3986) so reserved bytes like
+    // '#' and '?' don't truncate the href client-side; the Prefix is a
+    // server-fixed mount point and is emitted as-is.
     string Href(rel: string, isDir: bool) {
         var h: string = this.Prefix
         if (String_Length(rel) == 0) {
             h = h + "/"
         } else {
-            h = h + "/" + rel
+            h = h + "/" + WebDav.UrlEncodePath(rel)
             if (isDir) { h = h + "/" }
         }
         if (!String_StartsWith(h, "/")) { h = "/" + h }
@@ -566,6 +569,38 @@ public class WebDav {
     }
 
     static string XmlHead() { return "<?xml version=\"1.0\" encoding=\"utf-8\"?>" }
+
+    // Percent-encode a resource path for use in a <D:href> (RFC 3986).
+    // Encodes byte-by-byte so UTF-8 (accented names) round-trips; keeps the
+    // unreserved set (A-Z a-z 0-9 - . _ ~) and the path separator '/' raw.
+    // Crucial for '#' and '?', which clients otherwise read as the URI
+    // fragment / query delimiter — truncating the href and making the
+    // resource look absent even though it exists on disk.
+    static string UrlEncodePath(p: string) {
+        var enc: string = ""
+        @c {
+            static const char* _hex = "0123456789ABCDEF";
+            const unsigned char* _s = (const unsigned char*) p;
+            size_t _len = strlen((const char*) _s);
+            char* _buf = (char*) GC_MALLOC(_len * 3 + 1);
+            size_t _j = 0;
+            for (size_t _i = 0; _i < _len; _i++) {
+                unsigned char _c = _s[_i];
+                if ((_c >= 'A' && _c <= 'Z') || (_c >= 'a' && _c <= 'z') ||
+                    (_c >= '0' && _c <= '9') ||
+                    _c == '-' || _c == '.' || _c == '_' || _c == '~' || _c == '/') {
+                    _buf[_j++] = (char) _c;
+                } else {
+                    _buf[_j++] = '%';
+                    _buf[_j++] = _hex[_c >> 4];
+                    _buf[_j++] = _hex[_c & 0x0F];
+                }
+            }
+            _buf[_j] = '\0';
+            enc = (code_string) _buf;
+        }
+        return enc
+    }
 
     static string XmlEscape(s: string) {
         let amp: string = "&"
