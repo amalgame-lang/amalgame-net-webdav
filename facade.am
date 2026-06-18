@@ -803,10 +803,17 @@ public class WebDavNas {
     }
     bool IsAdmin(user: string) { return this.Admins.Has(user) }
 
+    // Authenticate (HTTP Basic) then route. Use DispatchAs when the caller
+    // already authenticated (e.g. a server that also gates a LoginGuard) —
+    // avoids a second scrypt verification per request.
     public HttpResponse Dispatch(req: HttpRequest) {
         let user: string = this.Auth.Authenticate(req)
         if (String_Length(user) == 0) { return this.Auth.Challenge() }
+        return this.DispatchAs(req, user)
+    }
 
+    // Route a request for an already-authenticated user (no re-auth).
+    public HttpResponse DispatchAs(req: HttpRequest, user: string) {
         var raw: string = req.Path
         let pl: int = String_Length(this.Prefix)
         if (pl > 0 && String_StartsWith(raw, this.Prefix)) {
