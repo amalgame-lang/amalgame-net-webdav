@@ -38,6 +38,8 @@ import Amalgame.Auth
     #include <stdio.h>
     #include <stdint.h>
     #include <string.h>
+    #include <stdlib.h>
+    #include <sys/xattr.h>
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -243,7 +245,10 @@ public class WebDav {
         let parent: string = WebDav.ParentOf(fs)
         if (!Filesystem.IsDir(parent)) { return WebDav.Empty(409) }
         let created: bool = !File.Exists(fs)
+        var oldSize: int = 0
+        if (!created) { oldSize = WebDav.FileSize(fs) }
         if (!WebDav.WriteBody(req, fs)) { return WebDav.Empty(500) }
+        this.BumpAncestors(fs, WebDav.FileSize(fs) - oldSize)
         if (created) { return WebDav.Empty(201) }
         return WebDav.Empty(204)
     }
@@ -251,7 +256,9 @@ public class WebDav {
     // ── DELETE ─────────────────────────────────────────────────────
     HttpResponse DoDelete(fs: string) {
         if (!File.Exists(fs)) { return WebDav.Empty(404) }
+        let sz: int = WebDav.NodeSizeFs(fs)
         if (!Filesystem.Remove(fs)) { return WebDav.Empty(500) }
+        this.BumpAncestors(fs, 0 - sz)
         return WebDav.Empty(204)
     }
 
@@ -262,6 +269,7 @@ public class WebDav {
         let parent: string = WebDav.ParentOf(fs)
         if (!Filesystem.IsDir(parent)) { return WebDav.Empty(409) }
         if (!Filesystem.MakeDir(fs)) { return WebDav.Empty(500) }
+        WebDav.DirSizeSet(fs, 0)
         return WebDav.Empty(201)
     }
 
@@ -286,12 +294,21 @@ public class WebDav {
         let destExists: bool = File.Exists(destFs)
         if (destExists && overwrite == "F") { return WebDav.Empty(412) }
         if (!Filesystem.IsDir(WebDav.ParentOf(destFs))) { return WebDav.Empty(409) }
-        if (destExists) { Filesystem.Remove(destFs) }
+        let srcSize: int = WebDav.NodeSizeFs(srcFs)
+        var destOld: int = 0
+        if (destExists) { destOld = WebDav.NodeSizeFs(destFs); Filesystem.Remove(destFs) }
 
         if (isMove) {
             if (!Filesystem.Move(srcFs, destFs)) { return WebDav.Empty(409) }
+            // rename préserve le xattr du sous-arbre déplacé ; on ajuste juste
+            // les totaux des ancêtres source (−) et destination (net).
+            this.BumpAncestors(srcFs, 0 - srcSize)
+            this.BumpAncestors(destFs, srcSize - destOld)
         } else {
             if (!WebDav.CopyTree(srcFs, destFs)) { return WebDav.Empty(500) }
+            this.BumpAncestors(destFs, srcSize - destOld)
+            // NB: copie d'un DOSSIER → les sous-dossiers copiés n'ont pas encore
+            // de xattr propre (cumul 0) jusqu'au prochain `sizescan` hebdo.
         }
         if (destExists) { return WebDav.Empty(204) }
         return WebDav.Empty(201)
@@ -305,7 +322,7 @@ public class WebDav {
         let depth: string = req.Header("depth")
         let oneLevel: bool = (depth != "0")
 
-        var body: string = WebDav.XmlHead() + "<D:multistatus xmlns:D=\"DAV:\">"
+        var body: string = WebDav.XmlHead() + "<D:multistatus xmlns:D=\"DAV:\" xmlns:oc=\"http://owncloud.org/ns\">"
         body = body + this.PropEntry(rel, fs)
         if (oneLevel && Filesystem.IsDir(fs)) {
             let names: List<string> = Filesystem.List(fs)
@@ -339,6 +356,9 @@ public class WebDav {
         x = x + "<D:displayname>" + WebDav.XmlEscape(name) + "</D:displayname>"
         if (isDir) {
             x = x + "<D:resourcetype><D:collection/></D:resourcetype>"
+            // Poids cumulé du dossier (cache xattr) — convention ownCloud,
+            // lu par la webui. 0 tant qu'aucun événement/scan ne l'a renseigné.
+            x = x + "<oc:size>" + String_FromInt(WebDav.DirSizeGet(fs)) + "</oc:size>"
         } else {
             x = x + "<D:resourcetype/>"
             x = x + "<D:getcontentlength>" + String_FromInt(WebDav.FileSize(fs)) + "</D:getcontentlength>"
@@ -715,6 +735,75 @@ public class WebDav {
         var r: int = 0
         @c { r = (i64) File_Mtime((code_string) path); }
         return r
+    }
+
+    // ── Taille cumulée des dossiers (cache xattr user.amdav.size) ──────
+    // Maintenue en live par les verbes d'écriture (PUT/DELETE/MOVE/COPY) et
+    // recalculée périodiquement par `server sizescan` (filet anti-dérive).
+    // Émise en <oc:size> dans le PROPFIND → la webui affiche le poids des
+    // dossiers sans parcourir l'arbre.
+    static int DirSizeGet(dir: string) {
+        var r: int = 0
+        @c {
+            char buf[32];
+            ssize_t n = getxattr((const char*) dir, "user.amdav.size", buf, sizeof(buf) - 1);
+            if (n > 0) { buf[n] = 0; r = (i64) atoll(buf); }
+        }
+        return r
+    }
+    static void DirSizeSet(dir: string, val: int) {
+        @c {
+            char out[32];
+            int len = snprintf(out, sizeof(out), "%lld", (long long) val);
+            setxattr((const char*) dir, "user.amdav.size", out, (size_t) len, 0);
+        }
+    }
+    static void DirSizeAdd(dir: string, delta: int) {
+        @c {
+            char buf[32]; long long cur = 0;
+            ssize_t n = getxattr((const char*) dir, "user.amdav.size", buf, sizeof(buf) - 1);
+            if (n > 0) { buf[n] = 0; cur = atoll(buf); }
+            cur += (long long) delta;
+            if (cur < 0) cur = 0;
+            char out[32];
+            int len = snprintf(out, sizeof(out), "%lld", cur);
+            setxattr((const char*) dir, "user.amdav.size", out, (size_t) len, 0);
+        }
+    }
+    // Taille d'un nœud : fichier → octets ; dossier → cumul caché.
+    static int NodeSizeFs(fs: string) {
+        if (Filesystem.IsDir(fs)) { return WebDav.DirSizeGet(fs) }
+        return WebDav.FileSize(fs)
+    }
+
+    // Recalcule récursivement (post-ordre) la taille cumulée de `dir` et de
+    // tous ses descendants, en réécrivant chaque xattr. Renvoie le total.
+    // Sert au seed initial et au rattrapage périodique (`server sizescan`) :
+    // remet d'aplomb toute dérive du cache live.
+    public static int ScanSizes(dir: string) {
+        var total: int = 0
+        let names: List<string> = Filesystem.List(dir)
+        var i: int = 0
+        while (i < names.Count()) {
+            let child: string = dir + "/" + names.Get(i)
+            if (Filesystem.IsDir(child)) { total = total + WebDav.ScanSizes(child) }
+            else { total = total + WebDav.FileSize(child) }
+            i = i + 1
+        }
+        WebDav.DirSizeSet(dir, total)
+        return total
+    }
+    // Propage `delta` au dossier parent de `fs` et à tous ses ancêtres
+    // jusqu'à la racine de ce moteur (incluse) — bornée à this.Root.
+    void BumpAncestors(fs: string, delta: int) {
+        if (delta == 0) { return }
+        let root: string = this.Root
+        var dir: string = WebDav.ParentOf(fs)
+        while (String_Length(dir) >= String_Length(root)) {
+            WebDav.DirSizeAdd(dir, delta)
+            if (dir == root) { return }
+            dir = WebDav.ParentOf(dir)
+        }
     }
 
     // Binary-safe write of the request body to `path`. Three sources, in
