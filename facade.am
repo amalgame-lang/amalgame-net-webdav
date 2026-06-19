@@ -742,7 +742,7 @@ public class WebDav {
     // recalculée périodiquement par `server sizescan` (filet anti-dérive).
     // Émise en <oc:size> dans le PROPFIND → la webui affiche le poids des
     // dossiers sans parcourir l'arbre.
-    static int DirSizeGet(dir: string) {
+    public static int DirSizeGet(dir: string) {
         var r: int = 0
         @c {
             char buf[32];
@@ -1044,12 +1044,12 @@ public class WebDavNas {
         }
         if (m == "PROPFIND") {
             let depth: string = req.Header("depth")
-            var body: string = WebDav.XmlHead() + "<D:multistatus xmlns:D=\"DAV:\">"
-            body = body + WebDavNas.Coll(this.Prefix + "/", "")
+            var body: string = WebDav.XmlHead() + "<D:multistatus xmlns:D=\"DAV:\" xmlns:oc=\"http://owncloud.org/ns\">"
+            body = body + WebDavNas.Coll(this.Prefix + "/", "", 0 - 1)
             if (depth != "0") {
-                body = body + WebDavNas.Coll(this.Prefix + "/home/", "home")
-                body = body + WebDavNas.Coll(this.Prefix + "/shared/", "shared")
-                if (admin) { body = body + WebDavNas.Coll(this.Prefix + "/all/", "all") }
+                body = body + WebDavNas.Coll(this.Prefix + "/home/", "home", WebDav.DirSizeGet(this.UsersDir + "/" + user))
+                body = body + WebDavNas.Coll(this.Prefix + "/shared/", "shared", WebDav.DirSizeGet(this.SharedDir))
+                if (admin) { body = body + WebDavNas.Coll(this.Prefix + "/all/", "all", 0 - 1) }
             }
             body = body + "</D:multistatus>"
             let r = HttpResponse.New().Status(207)
@@ -1075,14 +1075,17 @@ public class WebDavNas {
         let m: string = req.Method
         if (m == "PROPFIND") {
             let depth: string = req.Header("depth")
-            var body: string = WebDav.XmlHead() + "<D:multistatus xmlns:D=\"DAV:\">"
-            body = body + WebDavNas.Coll(this.Prefix + "/all/", "all")
+            let names: List<string> = Filesystem.List(this.UsersDir)
+            var total: int = 0
+            var k: int = 0
+            while (k < names.Count()) { total = total + WebDav.DirSizeGet(this.UsersDir + "/" + names.Get(k)); k = k + 1 }
+            var body: string = WebDav.XmlHead() + "<D:multistatus xmlns:D=\"DAV:\" xmlns:oc=\"http://owncloud.org/ns\">"
+            body = body + WebDavNas.Coll(this.Prefix + "/all/", "all", total)
             if (depth != "0") {
-                let names: List<string> = Filesystem.List(this.UsersDir)
                 var i: int = 0
                 while (i < names.Count()) {
                     let nm: string = names.Get(i)
-                    body = body + WebDavNas.Coll(this.Prefix + "/all/" + nm + "/", nm)
+                    body = body + WebDavNas.Coll(this.Prefix + "/all/" + nm + "/", nm, WebDav.DirSizeGet(this.UsersDir + "/" + nm))
                     i = i + 1
                 }
             }
@@ -1107,11 +1110,15 @@ public class WebDavNas {
         return WebDav.Empty(405)
     }
 
-    static string Coll(href: string, name: string) {
+    // Entrée <D:response> de collection synthétique. `size` < 0 = pas de
+    // <oc:size> (taille inconnue) ; >= 0 = poids cumulé émis (namespace oc à
+    // déclarer sur le <D:multistatus> appelant).
+    static string Coll(href: string, name: string, size: int) {
         var x: string = "<D:response><D:href>" + WebDav.XmlEscape(href) + "</D:href>"
         x = x + "<D:propstat><D:prop>"
         x = x + "<D:displayname>" + WebDav.XmlEscape(name) + "</D:displayname>"
         x = x + "<D:resourcetype><D:collection/></D:resourcetype>"
+        if (size >= 0) { x = x + "<oc:size>" + String_FromInt(size) + "</oc:size>" }
         x = x + "</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>"
         return x
     }
