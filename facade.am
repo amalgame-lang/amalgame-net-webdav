@@ -327,8 +327,11 @@ public class WebDav {
     // One <D:response> for a single resource.
     string PropEntry(rel: string, fs: string) {
         let isDir: bool = Filesystem.IsDir(fs)
-        let name:  string = WebDav.DisplayName(rel)
-        var x: string = "<D:response><D:href>" + WebDav.XmlEscape(this.Href(rel, isDir)) + "</D:href>"
+        let href:  string = this.Href(rel, isDir)
+        // Display name from the FULL href (prefix included) so a space root
+        // like "/home/" reports "home", not "/" (empty breadcrumb otherwise).
+        let name:  string = WebDav.DisplayName(href)
+        var x: string = "<D:response><D:href>" + WebDav.XmlEscape(href) + "</D:href>"
         x = x + "<D:propstat><D:prop>"
         x = x + "<D:displayname>" + WebDav.XmlEscape(name) + "</D:displayname>"
         if (isDir) {
@@ -526,11 +529,21 @@ public class WebDav {
         return String_Substring(fs, 0, i)
     }
 
-    static string DisplayName(rel: string) {
-        if (String_Length(rel) == 0) { return "/" }
-        let i: int = WebDav.LastIndexOf(rel, "/")
-        if (i < 0) { return rel }
-        return String_Substring(rel, i + 1, String_Length(rel) - i - 1)
+    // Display name = the last path segment of the FULL resource path (the
+    // href, prefix included). Callers pass the href so the root of a mounted
+    // space (e.g. "/home/") yields its real name ("home") rather than "/" —
+    // otherwise WebDAV file managers render an empty/slash breadcrumb button
+    // for the space level. Trailing slashes are stripped first; the very root
+    // ("/" or "") yields "" (the client labels it with the mount name).
+    static string DisplayName(path: string) {
+        var p: string = path
+        while (String_Length(p) > 0 && String_EndsWith(p, "/")) {
+            p = String_Substring(p, 0, String_Length(p) - 1)
+        }
+        if (String_Length(p) == 0) { return "" }
+        let i: int = WebDav.LastIndexOf(p, "/")
+        if (i < 0) { return p }
+        return String_Substring(p, i + 1, String_Length(p) - i - 1)
     }
 
     // Extract the path part of a Destination header (full URL or absolute
@@ -701,10 +714,22 @@ public class WebDav {
         return r
     }
 
-    // Binary-safe write of the request body to `path`. Uses the raw body
-    // buffer (BodyPtr/BodyLen) when present (the H1 wire path), else the
-    // text Body (tests / non-H1).
+    // Binary-safe write of the request body to `path`. Three sources, in
+    // order: (1) a temp file the H1 parser spooled the body to for large
+    // uploads (BodyFile, amalgame-net-http ≥ v0.28.0) — moved into place with
+    // an atomic rename (same volume) so a multi-hundred-MB PUT never sits in
+    // RAM; (2) the raw body buffer (BodyPtr/BodyLen) for in-RAM H1 bodies;
+    // (3) the text Body (tests / non-H1).
     static bool WriteBody(req: HttpRequest, path: string) {
+        let bf: string = req.BodyFile
+        if (String_Length(bf) > 0) {
+            // rename() remplace atomiquement une cible existante (même volume).
+            if (Filesystem.Move(bf, path)) { return true }
+            // Volume différent : copie en streaming puis suppression du temp.
+            let okc: bool = WebDav.CopyFile(bf, path)
+            Filesystem.Remove(bf)
+            return okc
+        }
         let ptr: int = req.BodyPtr
         let len: int = req.BodyLen
         if (ptr == 0 || len <= 0) {
@@ -928,7 +953,7 @@ public class WebDavNas {
         if (m == "PROPFIND") {
             let depth: string = req.Header("depth")
             var body: string = WebDav.XmlHead() + "<D:multistatus xmlns:D=\"DAV:\">"
-            body = body + WebDavNas.Coll(this.Prefix + "/", "/")
+            body = body + WebDavNas.Coll(this.Prefix + "/", "")
             if (depth != "0") {
                 body = body + WebDavNas.Coll(this.Prefix + "/home/", "home")
                 body = body + WebDavNas.Coll(this.Prefix + "/shared/", "shared")
