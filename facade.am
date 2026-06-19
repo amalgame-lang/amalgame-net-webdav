@@ -328,9 +328,12 @@ public class WebDav {
     string PropEntry(rel: string, fs: string) {
         let isDir: bool = Filesystem.IsDir(fs)
         let href:  string = this.Href(rel, isDir)
-        // Display name from the FULL href (prefix included) so a space root
-        // like "/home/" reports "home", not "/" (empty breadcrumb otherwise).
-        let name:  string = WebDav.DisplayName(href)
+        // Display name from the DECODED full path (Prefix + rel), NOT the href:
+        // the href is percent-encoded, so deriving the name from it would show
+        // "Priv%C3%A9" instead of "Privé". Prefix ("/home", …) and rel are both
+        // already decoded. Using the full path (not just rel) keeps a space root
+        // ("/home/", rel="") reporting "home" rather than "/" (empty breadcrumb).
+        let name:  string = WebDav.DisplayName(this.Prefix + "/" + rel)
         var x: string = "<D:response><D:href>" + WebDav.XmlEscape(href) + "</D:href>"
         x = x + "<D:propstat><D:prop>"
         x = x + "<D:displayname>" + WebDav.XmlEscape(name) + "</D:displayname>"
