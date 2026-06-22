@@ -33,6 +33,7 @@ import Amalgame.Net.Http
 import Amalgame.IO.Filesystem
 import Amalgame.DateTime
 import Amalgame.Auth
+import Amalgame.Formats.Xml
 
 @c {
     #include <stdio.h>
@@ -164,6 +165,17 @@ public class WebDav {
     public HttpResponse Dispatch(req: HttpRequest) {
         let m: string = req.Method
 
+        // CalDAV/CardDAV bootstrap: /.well-known/{caldav,carddav} → 301 to the
+        // collection root, where current-user-principal discovery begins
+        // (RFC 6764). Handled before prefix-stripping since .well-known lives
+        // at the site root, not under the engine's mount prefix.
+        if (WebDav.IsWellKnownDav(req.Path)) {
+            let wk = HttpResponse.New().Status(301)
+            wk.Header("Location", this.Prefix + "/")
+            wk.Header("Content-Length", "0")
+            return wk
+        }
+
         let raw: string = this.StripPrefix(req.Path)
         if (WebDav.HasTraversal(raw)) { return WebDav.Empty(403) }
         let rel: string = WebDav.CleanRel(raw)
@@ -190,19 +202,23 @@ public class WebDav {
         if (m == "PROPPATCH") { return this.DoProppatch(rel) }
         if (m == "LOCK")      { return this.DoLock(req, rel, fs) }
         if (m == "UNLOCK")    { return this.DoUnlock(req) }
+        if (m == "REPORT")     { return this.DoReport(req, rel, fs) }
+        if (m == "MKCALENDAR") { return this.DoMkcalendar(req, fs) }
 
         return WebDav.Empty(405)
     }
 
     // ── OPTIONS ────────────────────────────────────────────────────
     HttpResponse DoOptions() {
-        var allow: string = "OPTIONS, HEAD, GET, PROPFIND"
+        var allow: string = "OPTIONS, HEAD, GET, PROPFIND, REPORT"
         if (this.Writable) {
-            allow = allow + ", PUT, DELETE, MKCOL, COPY, MOVE, PROPPATCH"
+            allow = allow + ", PUT, DELETE, MKCOL, MKCALENDAR, COPY, MOVE, PROPPATCH"
         }
-        var dav: string = "1"
+        // DAV: 1 (Class 1) + calendar-access (CalDAV, RFC 4791) +
+        // addressbook (CardDAV, RFC 6352). Class 2 (locks) is opt-in.
+        var dav: string = "1, calendar-access, addressbook"
         if (this.LocksEnabled) {
-            dav = "1, 2"
+            dav = "1, 2, calendar-access, addressbook"
             if (this.Writable) { allow = allow + ", LOCK, UNLOCK" }
         }
         let r = HttpResponse.New().Status(200)
@@ -273,6 +289,101 @@ public class WebDav {
         return WebDav.Empty(201)
     }
 
+    // ── MKCALENDAR (CalDAV, RFC 4791) ──────────────────────────────
+    // Create a calendar collection. The request body (calendar props such as
+    // displayname / supported-component-set) is accepted but not persisted
+    // yet — the collection is created with defaults and tagged calendar.
+    HttpResponse DoMkcalendar(req: HttpRequest, fs: string) {
+        if (File.Exists(fs)) { return WebDav.Empty(405) }
+        let parent: string = WebDav.ParentOf(fs)
+        if (!Filesystem.IsDir(parent)) { return WebDav.Empty(409) }
+        if (!Filesystem.MakeDir(fs)) { return WebDav.Empty(500) }
+        WebDav.DirSizeSet(fs, 0)
+        WebDav.CollKindSet(fs, 1)
+        return WebDav.Empty(201)
+    }
+
+    // ── REPORT (CalDAV / CardDAV) ──────────────────────────────────
+    // The request-body XML is parsed with amalgame-formats-xml and matched
+    // by {namespace}local, so the client's prefix choice doesn't matter.
+    HttpResponse DoReport(req: HttpRequest, rel: string, fs: string) {
+        if (!File.Exists(fs)) { return WebDav.Empty(404) }
+        let root: XmlNode = Xml.Parse(req.Body)
+        let cal:  string = "urn:ietf:params:xml:ns:caldav"
+        let card: string = "urn:ietf:params:xml:ns:carddav"
+        if (root.Is(cal,  "calendar-multiget"))    { return this.ReportMultiget(root, false) }
+        if (root.Is(card, "addressbook-multiget")) { return this.ReportMultiget(root, true) }
+        if (root.Is(cal,  "calendar-query"))       { return this.ReportQuery(rel, fs, false) }
+        if (root.Is(card, "addressbook-query"))    { return this.ReportQuery(rel, fs, true) }
+        return WebDav.Empty(415)
+    }
+
+    // multiget — return the named resources (each <D:href>) with getetag +
+    // inline data. A missing href gets its own 404 propstat (per RFC 4791).
+    HttpResponse ReportMultiget(root: XmlNode, isAddr: bool) {
+        let DAV: string = "DAV:"
+        let hrefs: List<XmlNode> = root.All(DAV, "href")
+        var body: string = WebDav.XmlHead() + WebDav.MsRoot()
+        let n: int = hrefs.Count()
+        var i: int = 0
+        while (i < n) {
+            let h: XmlNode = hrefs.Get(i)
+            let url: string = h.Text()
+            let raw: string = this.StripPrefix(WebDav.UrlPathOf(url))
+            if (!WebDav.HasTraversal(raw)) {
+                let r2: string = WebDav.CleanRel(raw)
+                let f2: string = this.FsPath(r2)
+                if (File.Exists(f2) && !Filesystem.IsDir(f2)) {
+                    body = body + this.ResourceData(r2, f2, isAddr)
+                } else {
+                    body = body + this.NotFoundEntry(r2)
+                }
+            }
+            i = i + 1
+        }
+        body = body + "</D:multistatus>"
+        return WebDav.Ms207(body)
+    }
+
+    // query (MVP) — return every member of the target collection with getetag
+    // + data. The <C:filter> / <CARD:filter> is not evaluated yet: clients get
+    // the full set and filter locally (correct, just not bandwidth-optimal).
+    HttpResponse ReportQuery(dirRel: string, dirFs: string, isAddr: bool) {
+        if (!Filesystem.IsDir(dirFs)) { return WebDav.Empty(403) }
+        var body: string = WebDav.XmlHead() + WebDav.MsRoot()
+        let names: List<string> = Filesystem.List(dirFs)
+        let n: int = names.Count()
+        var i: int = 0
+        while (i < n) {
+            let r2: string = WebDav.JoinRel(dirRel, names.Get(i))
+            let f2: string = this.FsPath(r2)
+            if (!Filesystem.IsDir(f2)) { body = body + this.ResourceData(r2, f2, isAddr) }
+            i = i + 1
+        }
+        body = body + "</D:multistatus>"
+        return WebDav.Ms207(body)
+    }
+
+    // One <D:response> carrying getetag + (calendar|address)-data inline.
+    string ResourceData(rel: string, fs: string, isAddr: bool) {
+        let etag:    string = WebDav.ETagOf(fs)
+        let content: string = WebDav.ReadFileText(fs)
+        var openTag:  string = "<C:calendar-data>"
+        var closeTag: string = "</C:calendar-data>"
+        if (isAddr) { openTag = "<CARD:address-data>"; closeTag = "</CARD:address-data>" }
+        var x: string = "<D:response><D:href>" + WebDav.XmlEscape(this.Href(rel, false)) + "</D:href>"
+        x = x + "<D:propstat><D:prop>"
+        x = x + "<D:getetag>" + WebDav.XmlEscape(etag) + "</D:getetag>"
+        x = x + openTag + WebDav.XmlEscape(content) + closeTag
+        x = x + "</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>"
+        return x
+    }
+
+    string NotFoundEntry(rel: string) {
+        return "<D:response><D:href>" + WebDav.XmlEscape(this.Href(rel, false))
+            + "</D:href><D:status>HTTP/1.1 404 Not Found</D:status></D:response>"
+    }
+
     // ── COPY / MOVE ────────────────────────────────────────────────
     HttpResponse DoCopyMove(req: HttpRequest, srcRel: string, srcFs: string, isMove: bool) {
         if (!File.Exists(srcFs)) { return WebDav.Empty(404) }
@@ -322,7 +433,7 @@ public class WebDav {
         let depth: string = req.Header("depth")
         let oneLevel: bool = (depth != "0")
 
-        var body: string = WebDav.XmlHead() + "<D:multistatus xmlns:D=\"DAV:\" xmlns:oc=\"http://owncloud.org/ns\">"
+        var body: string = WebDav.XmlHead() + WebDav.MsRoot()
         body = body + this.PropEntry(rel, fs)
         if (oneLevel && Filesystem.IsDir(fs)) {
             let names: List<string> = Filesystem.List(fs)
@@ -355,7 +466,33 @@ public class WebDav {
         x = x + "<D:propstat><D:prop>"
         x = x + "<D:displayname>" + WebDav.XmlEscape(name) + "</D:displayname>"
         if (isDir) {
-            x = x + "<D:resourcetype><D:collection/></D:resourcetype>"
+            // Discovery pointers (RFC 6764 / 4791 / 6352). The engine is
+            // single-principal, so principal + home both resolve to the mount
+            // root — a client PROPFINDs here, follows calendar-home-set back to
+            // this same collection, and lists the MKCALENDAR'd collections
+            // under it. WebDavNas overrides these per authenticated user.
+            let home: string = this.Prefix + "/"
+            let hEsc: string = WebDav.XmlEscape(home)
+            x = x + "<D:current-user-principal><D:href>" + hEsc + "</D:href></D:current-user-principal>"
+            x = x + "<D:principal-URL><D:href>" + hEsc + "</D:href></D:principal-URL>"
+            x = x + "<C:calendar-home-set><D:href>" + hEsc + "</D:href></C:calendar-home-set>"
+            x = x + "<CARD:addressbook-home-set><D:href>" + hEsc + "</D:href></CARD:addressbook-home-set>"
+            let kind: int = WebDav.CollKindGet(fs)
+            if (kind == 1) {
+                x = x + "<D:resourcetype><D:collection/><C:calendar/></D:resourcetype>"
+                x = x + "<C:supported-calendar-component-set><C:comp name=\"VEVENT\"/><C:comp name=\"VTODO\"/></C:supported-calendar-component-set>"
+            } else if (kind == 2) {
+                x = x + "<D:resourcetype><D:collection/><CARD:addressbook/></D:resourcetype>"
+            } else {
+                x = x + "<D:resourcetype><D:collection/></D:resourcetype>"
+            }
+            // CTag (calendarserver.org) — collection sync token. Bumps when a
+            // member is added/removed/renamed (dir mtime+size). NB: an in-place
+            // edit that keeps the exact same byte size won't bump it — rare for
+            // iCalendar/vCard, and the per-resource getetag still changes.
+            if (kind != 0) {
+                x = x + "<CS:getctag>" + WebDav.XmlEscape(WebDav.ETagOf(fs)) + "</CS:getctag>"
+            }
             // Poids cumulé du dossier (cache xattr) — convention ownCloud,
             // lu par la webui. 0 tant qu'aucun événement/scan ne l'a renseigné.
             x = x + "<oc:size>" + String_FromInt(WebDav.DirSizeGet(fs)) + "</oc:size>"
@@ -363,6 +500,7 @@ public class WebDav {
             x = x + "<D:resourcetype/>"
             x = x + "<D:getcontentlength>" + String_FromInt(WebDav.FileSize(fs)) + "</D:getcontentlength>"
             x = x + "<D:getcontenttype>" + WebDav.XmlEscape(WebDav.MimeOf(fs)) + "</D:getcontenttype>"
+            x = x + "<D:getetag>" + WebDav.XmlEscape(WebDav.ETagOf(fs)) + "</D:getetag>"
         }
         x = x + "<D:getlastmodified>" + DateTime.FormatHttpDate(WebDav.FileMtime(fs)) + "</D:getlastmodified>"
         x = x + "</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>"
@@ -527,13 +665,22 @@ public class WebDav {
     }
 
     static bool IsWriteMethod(m: string) {
-        if (m == "PUT")       { return true }
-        if (m == "DELETE")    { return true }
-        if (m == "MKCOL")     { return true }
-        if (m == "COPY")      { return true }
-        if (m == "MOVE")      { return true }
-        if (m == "PROPPATCH") { return true }
+        if (m == "PUT")        { return true }
+        if (m == "DELETE")     { return true }
+        if (m == "MKCOL")      { return true }
+        if (m == "MKCALENDAR") { return true }
+        if (m == "COPY")       { return true }
+        if (m == "MOVE")       { return true }
+        if (m == "PROPPATCH")  { return true }
         if (m == "LOCK")      { return true }
+        return false
+    }
+
+    // /.well-known/caldav or /.well-known/carddav (with optional trailing
+    // slash) — the RFC 6764 service-discovery bootstrap path.
+    static bool IsWellKnownDav(path: string) {
+        if (String_StartsWith(path, "/.well-known/caldav"))  { return true }
+        if (String_StartsWith(path, "/.well-known/carddav")) { return true }
         return false
     }
 
@@ -605,6 +752,24 @@ public class WebDav {
     }
 
     static string XmlHead() { return "<?xml version=\"1.0\" encoding=\"utf-8\"?>" }
+
+    // <D:multistatus> open tag declaring every namespace the responses use:
+    // DAV:, ownCloud (oc:size), CalDAV (C:), CardDAV (CARD:), calendarserver
+    // (CS:getctag). Declaring them all up-front keeps the body builders to
+    // plain prefixed concatenation.
+    static string MsRoot() {
+        return "<D:multistatus xmlns:D=\"DAV:\" xmlns:oc=\"http://owncloud.org/ns\""
+            + " xmlns:C=\"urn:ietf:params:xml:ns:caldav\""
+            + " xmlns:CARD=\"urn:ietf:params:xml:ns:carddav\""
+            + " xmlns:CS=\"http://calendarserver.org/ns/\">"
+    }
+    // Wrap a finished multistatus body in a 207 response.
+    static HttpResponse Ms207(body: string) {
+        let r = HttpResponse.New().Status(207)
+        r.Header("Content-Type", "application/xml; charset=utf-8")
+        r.BodyText = body
+        return r
+    }
 
     // Percent-encode a resource path for use in a <D:href> (RFC 3986).
     // Encodes byte-by-byte so UTF-8 (accented names) round-trips; keeps the
@@ -737,6 +902,37 @@ public class WebDav {
         return r
     }
 
+    // Strong ETag from mtime+size — cheap (no content read). CalDAV /
+    // CardDAV clients use it for If-Match conditional writes and to detect
+    // per-resource changes during sync. Quoted per RFC 7232.
+    static string ETagOf(fs: string) {
+        let mt: int = WebDav.FileMtime(fs)
+        let sz: int = WebDav.FileSize(fs)
+        return "\"" + String_FromInt(mt) + "-" + String_FromInt(sz) + "\""
+    }
+
+    // Read a (text) file whole into a string — for serving calendar-data /
+    // address-data inline in a REPORT. NUL-truncates like any code_string,
+    // which is fine for UTF-8 iCalendar / vCard payloads.
+    static string ReadFileText(path: string) {
+        var r: string = ""
+        @c {
+            FILE* f = fopen((const char*) path, "rb");
+            if (f) {
+                fseek(f, 0, SEEK_END);
+                long sz = ftell(f);
+                fseek(f, 0, SEEK_SET);
+                if (sz < 0) sz = 0;
+                char* buf = (char*) GC_MALLOC((size_t) sz + 1);
+                size_t rd = fread(buf, 1, (size_t) sz, f);
+                buf[rd] = 0;
+                fclose(f);
+                r = (code_string) buf;
+            }
+        }
+        return r
+    }
+
     // ── Taille cumulée des dossiers (cache xattr user.amdav.size) ──────
     // Maintenue en live par les verbes d'écriture (PUT/DELETE/MOVE/COPY) et
     // recalculée périodiquement par `server sizescan` (filet anti-dérive).
@@ -770,6 +966,28 @@ public class WebDav {
             setxattr((const char*) dir, "user.amdav.size", out, (size_t) len, 0);
         }
     }
+    // ── Type de collection (xattr user.amdav.colltype) ────────────────
+    // 0 = collection ordinaire, 1 = calendrier (CalDAV), 2 = carnet
+    // d'adresses (CardDAV). Posé par MKCALENDAR / MKCOL étendu, lu par
+    // PROPFIND pour émettre le bon <D:resourcetype>. Même mécanisme xattr
+    // que la taille cumulée — invisible dans les listings.
+    public static int CollKindGet(dir: string) {
+        var r: int = 0
+        @c {
+            char buf[16];
+            ssize_t n = getxattr((const char*) dir, "user.amdav.colltype", buf, sizeof(buf) - 1);
+            if (n > 0) { buf[n] = 0; r = (i64) atoll(buf); }
+        }
+        return r
+    }
+    static void CollKindSet(dir: string, kind: int) {
+        @c {
+            char out[16];
+            int len = snprintf(out, sizeof(out), "%lld", (long long) kind);
+            setxattr((const char*) dir, "user.amdav.colltype", out, (size_t) len, 0);
+        }
+    }
+
     // Taille d'un nœud : fichier → octets ; dossier → cumul caché.
     static int NodeSizeFs(fs: string) {
         if (Filesystem.IsDir(fs)) { return WebDav.DirSizeGet(fs) }

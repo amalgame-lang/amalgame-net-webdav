@@ -278,6 +278,66 @@ public class Program {
         kAll2.Headers.Set("authorization", kidCred)
         c.Ok("nas: non-admin /all/<other> → 404", nas2.Dispatch(kAll2).StatusCode == 404)
 
+        // ── CalDAV / CardDAV (Phase 1) ───────────────────────────
+        let copt = dav.Dispatch(Program.req("OPTIONS", "/dav/"))
+        c.Ok("OPTIONS → calendar-access + REPORT + MKCALENDAR",
+            Program.has(copt.Headers.Get("DAV"), "calendar-access")
+            && Program.has(copt.Headers.Get("Allow"), "REPORT")
+            && Program.has(copt.Headers.Get("Allow"), "MKCALENDAR"))
+
+        let mkc = dav.Dispatch(Program.req("MKCALENDAR", "/dav/cal"))
+        c.Ok("MKCALENDAR → 201 + dir created", mkc.StatusCode == 201 && Filesystem.IsDir(root + "/cal"))
+
+        let cpf = dav.Dispatch(Program.req("PROPFIND", "/dav/cal"))
+        c.Ok("PROPFIND calendar → <C:calendar/> + getctag",
+            cpf.StatusCode == 207
+            && Program.has(cpf.BodyText, "<C:calendar/>")
+            && Program.has(cpf.BodyText, "getctag"))
+
+        let pev = Program.req("PUT", "/dav/cal/a.ics")
+        pev.Body = "BEGIN:VCALENDAR\nVERSION:2.0\nBEGIN:VEVENT\nUID:1\nSUMMARY:Hi\nEND:VEVENT\nEND:VCALENDAR\n"
+        c.Ok("PUT .ics → 201", dav.Dispatch(pev).StatusCode == 201)
+
+        let epf = dav.Dispatch(Program.req("PROPFIND", "/dav/cal/a.ics"))
+        c.Ok("PROPFIND .ics → getetag present", epf.StatusCode == 207 && Program.has(epf.BodyText, "getetag"))
+
+        let mg = Program.req("REPORT", "/dav/cal")
+        mg.Body = "<C:calendar-multiget xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\"><D:prop><D:getetag/><C:calendar-data/></D:prop><D:href>/dav/cal/a.ics</D:href></C:calendar-multiget>"
+        let mgr = dav.Dispatch(mg)
+        c.Ok("REPORT calendar-multiget → 207 + etag + calendar-data",
+            mgr.StatusCode == 207
+            && Program.has(mgr.BodyText, "getetag")
+            && Program.has(mgr.BodyText, "calendar-data")
+            && Program.has(mgr.BodyText, "VEVENT"))
+
+        let cq = Program.req("REPORT", "/dav/cal")
+        cq.Body = "<C:calendar-query xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\"><D:prop><D:getetag/><C:calendar-data/></D:prop><C:filter><C:comp-filter name=\"VCALENDAR\"/></C:filter></C:calendar-query>"
+        let cqr = dav.Dispatch(cq)
+        c.Ok("REPORT calendar-query → 207 + member data",
+            cqr.StatusCode == 207 && Program.has(cqr.BodyText, "a.ics") && Program.has(cqr.BodyText, "VEVENT"))
+
+        dav.Dispatch(Program.req("MKCOL", "/dav/contacts"))
+        let pvc = Program.req("PUT", "/dav/contacts/c.vcf")
+        pvc.Body = "BEGIN:VCARD\nVERSION:3.0\nFN:Bob\nEND:VCARD\n"
+        dav.Dispatch(pvc)
+        let amg = Program.req("REPORT", "/dav/contacts")
+        amg.Body = "<CARD:addressbook-multiget xmlns:D=\"DAV:\" xmlns:CARD=\"urn:ietf:params:xml:ns:carddav\"><D:href>/dav/contacts/c.vcf</D:href></CARD:addressbook-multiget>"
+        let amgr = dav.Dispatch(amg)
+        c.Ok("REPORT addressbook-multiget → 207 + address-data",
+            amgr.StatusCode == 207 && Program.has(amgr.BodyText, "address-data") && Program.has(amgr.BodyText, "VCARD"))
+
+        // Discovery: .well-known → 301; root PROPFIND exposes principal + home-sets.
+        let wk = dav.Dispatch(Program.req("GET", "/.well-known/caldav"))
+        c.Ok("/.well-known/caldav → 301 + Location",
+            wk.StatusCode == 301 && Program.has(wk.Headers.Get("Location"), "/dav/"))
+
+        let dpf = dav.Dispatch(Program.req("PROPFIND", "/dav/"))
+        c.Ok("PROPFIND root → current-user-principal + home-sets",
+            dpf.StatusCode == 207
+            && Program.has(dpf.BodyText, "current-user-principal")
+            && Program.has(dpf.BodyText, "calendar-home-set")
+            && Program.has(dpf.BodyText, "addressbook-home-set"))
+
         // cleanup
         Filesystem.Remove(root)
 
