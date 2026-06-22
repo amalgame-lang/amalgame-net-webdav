@@ -11,6 +11,7 @@ amalgame-net-http       = ">=0.28.0"
 amalgame-io-filesystem  = ">=0.2.0"
 amalgame-datetime       = ">=0.2.2"
 amalgame-auth           = ">=0.1.0"
+amalgame-formats-xml    = ">=0.1.0"
 
 [stdlib]
 classes   = ["WebDav", "DavLock", "DavLockStore", "WebDavNas"]

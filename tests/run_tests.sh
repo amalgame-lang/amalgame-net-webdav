@@ -40,7 +40,8 @@ DATETIME_DIR="$(sib AMALGAME_DATETIME amalgame-datetime)"
 IOFS_DIR="$(sib AMALGAME_IO_FS amalgame-io-filesystem)"
 CRYPTO_DIR="$(sib AMALGAME_CRYPTO amalgame-crypto)"
 AUTH_DIR="$(sib AMALGAME_AUTH amalgame-auth)"
-for d in "$NETHTTP_DIR:facade.am" "$TLS_DIR:runtime" "$ASYNC_DIR:amalgame.toml" "$DATETIME_DIR:facade.am" "$IOFS_DIR:facade.am" "$CRYPTO_DIR:facade.am" "$AUTH_DIR:facade.am"; do
+XML_DIR="$(sib AMALGAME_FORMATS_XML amalgame-formats-xml)"
+for d in "$NETHTTP_DIR:facade.am" "$TLS_DIR:runtime" "$ASYNC_DIR:amalgame.toml" "$DATETIME_DIR:facade.am" "$IOFS_DIR:facade.am" "$CRYPTO_DIR:facade.am" "$AUTH_DIR:facade.am" "$XML_DIR:facade.am"; do
     p="${d%%:*}"; m="${d##*:}"
     [ -e "$p/$m" ] || { echo "error: dependency missing ($p/$m)"; exit 2; }
 done
@@ -82,7 +83,7 @@ tag  = "v0.4.0"
 rev  = "fedcba9876543210000000000000000000000ff"
 EOF
 
-INC="-Iruntime -I$PKG_DIR -I$NETHTTP_DIR/runtime -I$TLS_DIR/runtime -I$ASYNC_DIR/runtime -I$DATETIME_DIR -I$IOFS_DIR -I$CRYPTO_DIR -I$AUTH_DIR -I$RUNTIME_DIR"
+INC="-Iruntime -I$PKG_DIR -I$NETHTTP_DIR/runtime -I$TLS_DIR/runtime -I$ASYNC_DIR/runtime -I$DATETIME_DIR -I$IOFS_DIR -I$CRYPTO_DIR -I$AUTH_DIR -I$XML_DIR -I$RUNTIME_DIR"
 
 # ── build dependency .o files ─────────────────────────────────────────
 # Order is significant (a class must be compiled before a later file
@@ -111,12 +112,17 @@ gcc -O2 $INC -c "$BUILD_DIR/crypto.c" -o "$BUILD_DIR/crypto.o" 2>"$BUILD_DIR/gcc
 gcc -O2 $INC -c "$BUILD_DIR/auth.c" -o "$BUILD_DIR/auth.o" 2>"$BUILD_DIR/gcc.log" \
     || { echo -e "${RED}auth build failed${NC}"; cat "$BUILD_DIR/gcc.log"; exit 1; }
 
+"$AMC" --lib -o "$BUILD_DIR/xml" "$XML_DIR/facade.am" >/dev/null 2>&1
+gcc -O2 $INC -c "$BUILD_DIR/xml.c" -o "$BUILD_DIR/xml.o" 2>"$BUILD_DIR/gcc.log" \
+    || { echo -e "${RED}formats-xml build failed${NC}"; cat "$BUILD_DIR/gcc.log"; exit 1; }
+
 # ── build the webdav facade .o ────────────────────────────────────────
 "$AMC" --lib -o "$BUILD_DIR/facade" facade.am \
     --external "$DATETIME_DIR/facade.am" \
     --external "$IOFS_DIR/facade.am" \
     --external "$CRYPTO_DIR/facade.am" \
-    --external "$AUTH_DIR/facade.am" 2>&1 | tail -20
+    --external "$AUTH_DIR/facade.am" \
+    --external "$XML_DIR/facade.am" 2>&1 | tail -20
 gcc -O2 $INC -c "$BUILD_DIR/facade.c" -o "$BUILD_DIR/facade.o" 2>"$BUILD_DIR/gcc.log" \
     || { echo -e "${RED}facade build failed${NC}"; cat "$BUILD_DIR/gcc.log"; exit 1; }
 
@@ -130,9 +136,10 @@ build_and_run() {
         --external "$IOFS_DIR/facade.am" \
         --external "$CRYPTO_DIR/facade.am" \
         --external "$AUTH_DIR/facade.am" \
+        --external "$XML_DIR/facade.am" \
         --external facade.am 2>&1 | tail -20
     gcc -O2 $INC "$BUILD_DIR/$name.c" \
-        "$BUILD_DIR/facade.o" "$BUILD_DIR/nethttp.o" "$BUILD_DIR/datetime.o" "$BUILD_DIR/iofs.o" "$BUILD_DIR/crypto.o" "$BUILD_DIR/auth.o" \
+        "$BUILD_DIR/facade.o" "$BUILD_DIR/nethttp.o" "$BUILD_DIR/datetime.o" "$BUILD_DIR/iofs.o" "$BUILD_DIR/crypto.o" "$BUILD_DIR/auth.o" "$BUILD_DIR/xml.o" \
         -lgc -lm -lz -lssl -lcrypto -lpthread -o "$BUILD_DIR/$name" 2>"$BUILD_DIR/gcc.log" \
         || { echo -e "${RED}${name} link failed${NC}"; cat "$BUILD_DIR/gcc.log"; exit 1; }
     local out; out="$("$BUILD_DIR/$name")"
