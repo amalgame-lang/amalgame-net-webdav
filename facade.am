@@ -1194,6 +1194,16 @@ public class WebDavNas {
 
     // Route a request for an already-authenticated user (no re-auth).
     public HttpResponse DispatchAs(req: HttpRequest, user: string) {
+        // .well-known bootstrap also handled here: a front controller that
+        // authenticates up-front then calls DispatchAs directly (e.g. the
+        // family NAS, to avoid a second scrypt) bypasses Dispatch's pre-auth
+        // shortcut, so the RFC 6764 redirect must live on this path too.
+        if (WebDav.IsWellKnownDav(req.Path)) {
+            let wk = HttpResponse.New().Status(301)
+            wk.Header("Location", this.Prefix + "/")
+            wk.Header("Content-Length", "0")
+            return wk
+        }
         var raw: string = req.Path
         let pl: int = String_Length(this.Prefix)
         if (pl > 0 && String_StartsWith(raw, this.Prefix)) {
