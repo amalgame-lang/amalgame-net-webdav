@@ -1,0 +1,117 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Test against amc ${{ matrix.amc-tag }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Floor is v0.8.72: amalgame-formats-xml (a dep) mis-generates a
+        # C forward decl on earlier amc (method returning a sibling class
+        # of the same facade). Validated locally at this tag.
+        amc-tag: [v0.8.72]
+    steps:
+      # net-webdav lives in webdav/ so its sibling deps sit next to it,
+      # matching the local-dev layout tests/run_tests.sh falls back to
+      # ($PKG_DIR/../<sibling>), and pinned via the AMALGAME_* env vars.
+      - uses: actions/checkout@v4
+        with:
+          path: webdav
+
+      # Core dependency — Dispatch returns HttpRequest/HttpResponse and the
+      # tests drive HttpParser. The runner auto-attaches it (fake cache +
+      # transient lock) and picks the checkout up via $AMALGAME_NET_HTTP.
+      - uses: actions/checkout@v4
+        with:
+          repository: amalgame-lang/amalgame-net-http
+          ref: v0.29.2
+          path: amalgame-net-http
+
+      # net-http's HTTPS client path links amalgame-tls's runtime.
+      - uses: actions/checkout@v4
+        with:
+          repository: amalgame-lang/amalgame-tls
+          ref: v0.3.5
+          path: amalgame-tls
+
+      # net-http's ServeAsync links amalgame-async (C-only, fake-cache).
+      - uses: actions/checkout@v4
+        with:
+          repository: amalgame-lang/amalgame-async
+          ref: v0.4.0
+          path: amalgame-async
+
+      # Pure-AM facades wired with --external by the runner.
+      - uses: actions/checkout@v4
+        with:
+          repository: amalgame-lang/amalgame-datetime
+          ref: v0.2.2
+          path: amalgame-datetime
+      - uses: actions/checkout@v4
+        with:
+          repository: amalgame-lang/amalgame-io-filesystem
+          ref: v0.2.0
+          path: amalgame-io-filesystem
+      - uses: actions/checkout@v4
+        with:
+          repository: amalgame-lang/amalgame-crypto
+          ref: v0.8.0
+          path: amalgame-crypto
+      # amalgame-auth (BasicAuth / Credentials / Password) — the WebDavNas
+      # multi-user engine and the live discovery tests depend on it.
+      - uses: actions/checkout@v4
+        with:
+          repository: amalgame-lang/amalgame-auth
+          ref: v0.2.0
+          path: amalgame-auth
+      # amalgame-formats-xml — the CalDAV/CardDAV REPORT body parser.
+      - uses: actions/checkout@v4
+        with:
+          repository: amalgame-lang/amalgame-formats-xml
+          ref: v0.1.0
+          path: amalgame-formats-xml
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libgc-dev libssl-dev libcurl4-openssl-dev zlib1g-dev
+
+      - name: Download amc ${{ matrix.amc-tag }}
+        run: |
+          set -e
+          TAG="${{ matrix.amc-tag }}"
+          VERSION="${TAG#v}"
+          curl -sSL -o amc.tar.gz \
+            "https://github.com/amalgame-lang/Amalgame/releases/download/${TAG}/amc-${VERSION}-linux-x86_64.tar.gz"
+          mkdir -p $RUNNER_TEMP/amc-install
+          tar -xzf amc.tar.gz -C $RUNNER_TEMP/amc-install --strip-components=1
+          # v0.8.x layout: bin/amc + share/amalgame/runtime. Locate robustly.
+          AMC_BIN="$(find $RUNNER_TEMP/amc-install -name amc -type f | head -1)"
+          AMC_RT="$(dirname "$(find $RUNNER_TEMP/amc-install -name '_runtime.h' | head -1)")"
+          echo "AMC=$AMC_BIN" >> $GITHUB_ENV
+          echo "AMC_RUNTIME=$AMC_RT" >> $GITHUB_ENV
+
+      - name: Verify amc
+        run: $AMC --version
+
+      - name: Run tests
+        working-directory: webdav
+        env:
+          AMALGAME_NET_HTTP:    ${{ github.workspace }}/amalgame-net-http
+          AMALGAME_TLS:         ${{ github.workspace }}/amalgame-tls
+          AMALGAME_ASYNC:       ${{ github.workspace }}/amalgame-async
+          AMALGAME_DATETIME:    ${{ github.workspace }}/amalgame-datetime
+          AMALGAME_IO_FS:       ${{ github.workspace }}/amalgame-io-filesystem
+          AMALGAME_CRYPTO:      ${{ github.workspace }}/amalgame-crypto
+          AMALGAME_AUTH:        ${{ github.workspace }}/amalgame-auth
+          AMALGAME_FORMATS_XML: ${{ github.workspace }}/amalgame-formats-xml
+        run: ./tests/run_tests.sh "$AMC"
