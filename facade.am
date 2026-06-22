@@ -1177,6 +1177,16 @@ public class WebDavNas {
     // already authenticated (e.g. a server that also gates a LoginGuard) —
     // avoids a second scrypt verification per request.
     public HttpResponse Dispatch(req: HttpRequest) {
+        // CalDAV/CardDAV bootstrap (RFC 6764): /.well-known/{caldav,carddav}
+        // → 301 to the NAS root, where per-account discovery begins. Handled
+        // before auth — the redirect carries no user data, and a client
+        // probes .well-known before it has anywhere to send credentials.
+        if (WebDav.IsWellKnownDav(req.Path)) {
+            let wk = HttpResponse.New().Status(301)
+            wk.Header("Location", this.Prefix + "/")
+            wk.Header("Content-Length", "0")
+            return wk
+        }
         let user: string = this.Auth.Authenticate(req)
         if (String_Length(user) == 0) { return this.Auth.Challenge() }
         return this.DispatchAs(req, user)

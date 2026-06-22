@@ -250,6 +250,12 @@ public class Program {
             && Program.has(nasHome.BodyText, "<C:calendar/>")
             && Program.has(nasHome.BodyText, "<CS:getctag>"))
 
+        // .well-known bootstrap on the NAS → 301 to the root (pre-auth).
+        let nasWk = nas.Dispatch(HttpParser.ParseFull(
+            Program.raw("PROPFIND", "/.well-known/caldav", Program.hdrs(), "")))
+        c.Ok("NAS /.well-known/caldav → 301 Location /dav/",
+            nasWk.StatusCode == 301 && nasWk.Headers.Get("Location") == "/dav/")
+
         // Unauthenticated NAS root → 401 (discovery must not leak pre-auth).
         let nasAnon = nas.Dispatch(HttpParser.ParseFull(
             Program.raw("PROPFIND", "/dav/", Program.hdrs(), "")))
