@@ -200,6 +200,61 @@ public class Program {
                 + "' (clients key off the numeric code; production sets the line in C)")
         }
 
+        // ── 10. WebDavNas: account-based discovery (multi-user) ─────
+        // The synthetic NAS root must point an authenticated client at its
+        // per-user home-set, so sync works via the *account* URL (not a
+        // direct calendar URL). This is the gap that blocked the family NAS.
+        let nroot: string = "/tmp/amalgame-caldav-nas"
+        Filesystem.Remove(nroot)
+        Filesystem.MakeDir(nroot)
+        let nas = WebDavNas.New(nroot + "/users", nroot + "/shared", "/dav").WithLocks()
+        nas.AddUser("alice", Password.Hash("alicepw"))
+        let aliceCred: string = "Basic " + BasicAuth.EncodeBase64Std("alice:alicepw")
+
+        let ah: List<string> = Program.hdrs()
+        ah.Add("Authorization: " + aliceCred)
+        ah.Add("Depth: 0")
+
+        // OPTIONS on the NAS root advertises calendar-access.
+        let nasOptWire: string = nas.Dispatch(HttpParser.ParseFull(
+            Program.raw("OPTIONS", "/dav/", ah, ""))).Render()
+        let nasOpt: HttpResponse = HttpParser.ParseResponse(nasOptWire)
+        c.Ok("NAS root OPTIONS advertises calendar-access",
+            Program.has(HttpParser.HeaderValue(nasOpt, "dav"), "calendar-access"))
+
+        // PROPFIND on the NAS root returns discovery pointers → /dav/home/.
+        let nasRootWire: string = nas.Dispatch(HttpParser.ParseFull(
+            Program.raw("PROPFIND", "/dav/", ah, ""))).Render()
+        let nasRoot: HttpResponse = HttpParser.ParseResponse(nasRootWire)
+        c.Ok("NAS root PROPFIND → current-user-principal + calendar-home-set /dav/home/",
+            nasRoot.StatusCode == 207
+            && Program.has(nasRoot.BodyText, "<D:current-user-principal><D:href>/dav/home/</D:href>")
+            && Program.has(nasRoot.BodyText, "<C:calendar-home-set><D:href>/dav/home/</D:href>")
+            && Program.has(nasRoot.BodyText, "<CARD:addressbook-home-set><D:href>/dav/home/</D:href>"))
+
+        // Full account-based chain: create a calendar in the home-set, then
+        // enumerate it the way a client following the discovery would.
+        let nasMk = nas.Dispatch(HttpParser.ParseFull(
+            Program.raw("MKCALENDAR", "/dav/home/perso/", ah, "")))
+        c.Ok("NAS: MKCALENDAR /dav/home/perso/ → 201", nasMk.StatusCode == 201)
+
+        let nh1: List<string> = Program.hdrs()
+        nh1.Add("Authorization: " + aliceCred)
+        nh1.Add("Depth: 1")
+        let nasHomeWire: string = nas.Dispatch(HttpParser.ParseFull(
+            Program.raw("PROPFIND", "/dav/home/", nh1, ""))).Render()
+        let nasHome: HttpResponse = HttpParser.ParseResponse(nasHomeWire)
+        c.Ok("NAS: PROPFIND home-set lists the calendar with <C:calendar/> + getctag",
+            nasHome.StatusCode == 207
+            && Program.has(nasHome.BodyText, "/dav/home/perso/")
+            && Program.has(nasHome.BodyText, "<C:calendar/>")
+            && Program.has(nasHome.BodyText, "<CS:getctag>"))
+
+        // Unauthenticated NAS root → 401 (discovery must not leak pre-auth).
+        let nasAnon = nas.Dispatch(HttpParser.ParseFull(
+            Program.raw("PROPFIND", "/dav/", Program.hdrs(), "")))
+        c.Ok("NAS root without credentials → 401", nasAnon.StatusCode == 401)
+
         Console.WriteLine("")
         Console.WriteLine("CalDAV live: " + String_FromInt(c.Pass) + "/"
             + String_FromInt(c.Total) + " passed")

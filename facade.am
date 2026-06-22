@@ -1251,8 +1251,11 @@ public class WebDavNas {
         let m: string = req.Method
         let admin: bool = this.IsAdmin(user)
         if (m == "OPTIONS") {
-            var dav: string = "1"
-            if (this.LocksEnabled) { dav = "1, 2" }
+            // Advertise CalDAV/CardDAV on the synthetic root too: a client
+            // does OPTIONS on the context path (RFC 6764) to confirm the
+            // server speaks calendar-access before walking the home-set.
+            var dav: string = "1, calendar-access, addressbook"
+            if (this.LocksEnabled) { dav = "1, 2, calendar-access, addressbook" }
             let r = HttpResponse.New().Status(200)
             r.Header("DAV", dav)
             r.Header("Allow", "OPTIONS, PROPFIND, GET, HEAD")
@@ -1262,8 +1265,14 @@ public class WebDavNas {
         }
         if (m == "PROPFIND") {
             let depth: string = req.Header("depth")
-            var body: string = WebDav.XmlHead() + "<D:multistatus xmlns:D=\"DAV:\" xmlns:oc=\"http://owncloud.org/ns\">"
-            body = body + WebDavNas.Coll(this.Prefix + "/", "", 0 - 1)
+            // Full namespace set (D/oc/C/CARD/CS) so the root entry can carry
+            // CalDAV/CardDAV discovery pointers. The synthetic root resolves
+            // principal + both home-sets to /<prefix>/home/ — the per-user
+            // engine, which already emits the matching pointers and lists the
+            // user's MKCALENDAR'd collections. This is what lets a client sync
+            // via the account URL instead of a direct calendar URL.
+            var body: string = WebDav.XmlHead() + WebDav.MsRoot()
+            body = body + this.RootEntry()
             if (depth != "0") {
                 body = body + WebDavNas.Coll(this.Prefix + "/home/", "home", WebDav.DirSizeGet(this.UsersDir + "/" + user))
                 body = body + WebDavNas.Coll(this.Prefix + "/shared/", "shared", WebDav.DirSizeGet(this.SharedDir))
@@ -1326,6 +1335,28 @@ public class WebDavNas {
             return r
         }
         return WebDav.Empty(405)
+    }
+
+    // The synthetic-root self <D:response> carrying CalDAV/CardDAV discovery
+    // pointers. principal + calendar-home-set + addressbook-home-set all
+    // resolve to /<prefix>/home/, which Basic auth has already bound to the
+    // authenticated user's home engine. A client PROPFINDs the root, reads the
+    // home-set, then PROPFINDs /<prefix>/home/ (→ HomeInstance) to list that
+    // user's calendars/addressbooks. WebDav (mono) emits the equivalent block
+    // for its own mount root; here it is per-user via the /home routing.
+    string RootEntry() {
+        let home: string = this.Prefix + "/home/"
+        let hEsc: string = WebDav.XmlEscape(home)
+        var x: string = "<D:response><D:href>" + WebDav.XmlEscape(this.Prefix + "/") + "</D:href>"
+        x = x + "<D:propstat><D:prop>"
+        x = x + "<D:displayname></D:displayname>"
+        x = x + "<D:resourcetype><D:collection/></D:resourcetype>"
+        x = x + "<D:current-user-principal><D:href>" + hEsc + "</D:href></D:current-user-principal>"
+        x = x + "<D:principal-URL><D:href>" + hEsc + "</D:href></D:principal-URL>"
+        x = x + "<C:calendar-home-set><D:href>" + hEsc + "</D:href></C:calendar-home-set>"
+        x = x + "<CARD:addressbook-home-set><D:href>" + hEsc + "</D:href></CARD:addressbook-home-set>"
+        x = x + "</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>"
+        return x
     }
 
     // Entrée <D:response> de collection synthétique. `size` < 0 = pas de
