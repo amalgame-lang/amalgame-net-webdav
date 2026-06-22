@@ -1,0 +1,207 @@
+// Live wire-replay tests for the CalDAV/CardDAV path.
+//
+// Unlike webdav_test.am — which hand-builds an HttpRequest object and
+// calls Dispatch directly — these tests feed VERBATIM raw HTTP/1.1 bytes
+// (exactly what DAVx5 / iOS Calendar put on the wire) through the real
+// parser, run Dispatch, then RENDER the response back to wire bytes and
+// re-parse it the way a client would. That exercises the two code paths
+// the unit tests skip entirely: HttpParser.ParseFull (request parsing)
+// and HttpResponse.Render (response serialization + Content-Length).
+//
+// The marquee assertion is Content-Length vs the true UTF-8 byte length
+// of the body: a client reads exactly Content-Length bytes off the
+// socket, so if that count is wrong for a body with accented calendar
+// data the client gets truncated XML and the sync fails.
+
+namespace Tests
+
+import Amalgame.String
+import Amalgame.Collections
+import Amalgame.Net.Http
+import Amalgame.IO.Filesystem
+import Amalgame.Crypto
+import Amalgame.Auth
+import Amalgame.Net.WebDav
+
+public class Counter {
+    public Pass:  int
+    public Total: int
+    public Counter() { this.Pass = 0; this.Total = 0 }
+    public void Ok(label: string, cond: bool) {
+        this.Total = this.Total + 1
+        if (cond) { Console.WriteLine("[PASS] " + label); this.Pass = this.Pass + 1 }
+        else      { Console.WriteLine("[FAIL] " + label) }
+    }
+    public void Note(label: string) { Console.WriteLine("[NOTE] " + label) }
+}
+
+public class Program {
+    static string CRLF() { return String_FromByte(13) + "\n" }
+
+    static bool has(hay: string, needle: string) {
+        return String_IndexOf(hay, needle) >= 0
+    }
+
+    // Independent byte count — does NOT route through String_Length, so a
+    // char-vs-byte discrepancy in the runtime shows up here.
+    static int ByteLen(s: string) {
+        var n: int = 0
+        @c { n = (i64) strlen((code_string) s); }
+        return n
+    }
+
+    static int ToInt(s: string) {
+        var n: int = 0
+        @c { n = (i64) atoi((code_string) s); }
+        return n
+    }
+
+    // Build a complete raw HTTP/1.1 request (header block + body), the way
+    // it arrives off a socket: CRLF line endings, blank line, then body.
+    static string raw(method: string, path: string, headers: List<string>, body: string) {
+        let crlf: string = Program.CRLF()
+        var s: string = method + " " + path + " HTTP/1.1" + crlf
+        s = s + "Host: dav.example.org" + crlf
+        var i: int = 0
+        while (i < headers.Count()) { s = s + headers.Get(i) + crlf; i = i + 1 }
+        s = s + "Content-Length: " + String_FromInt(Program.ByteLen(body)) + crlf
+        s = s + crlf + body
+        return s
+    }
+
+    static List<string> hdrs() { return new List<string>() }
+
+    public static void Main(string[] args) {
+        Console.WriteLine("amalgame-net-webdav — CalDAV live wire-replay tests")
+        let c = new Counter()
+        let crlf: string = Program.CRLF()
+
+        let root: string = "/tmp/amalgame-caldav-live"
+        Filesystem.Remove(root)
+        Filesystem.MakeDir(root)
+
+        let dav = WebDav.New(root, "/dav")
+
+        // ── Provision a calendar with one UTF-8 event ───────────────
+        // MKCALENDAR /dav/cal/  → calendar collection (CollKind = 1)
+        let mk = dav.Dispatch(HttpParser.ParseFull(
+            Program.raw("MKCALENDAR", "/dav/cal/", Program.hdrs(), "")))
+        c.Ok("MKCALENDAR /dav/cal/ → 201", mk.StatusCode == 201)
+
+        // PUT an event whose SUMMARY carries multi-byte UTF-8 ("Réunion café").
+        let ics: string = "BEGIN:VCALENDAR" + crlf + "VERSION:2.0" + crlf +
+            "BEGIN:VEVENT" + crlf +
+            "UID:evt-1@example.org" + crlf +
+            "SUMMARY:Réunion café — déjeuner à Noël" + crlf +
+            "DTSTART:20260624T090000Z" + crlf +
+            "END:VEVENT" + crlf + "END:VCALENDAR" + crlf
+        let put = dav.Dispatch(HttpParser.ParseFull(
+            Program.raw("PUT", "/dav/cal/evt1.ics",
+                Program.hdrs(), ics)))
+        c.Ok("PUT /dav/cal/evt1.ics → 201", put.StatusCode == 201)
+
+        // ── 1. .well-known bootstrap (RFC 6764) ─────────────────────
+        let wk = dav.Dispatch(HttpParser.ParseFull(
+            Program.raw("PROPFIND", "/.well-known/caldav", Program.hdrs(), "")))
+        c.Ok(".well-known/caldav → 301 Location /dav/",
+            wk.StatusCode == 301 && wk.Headers.Get("Location") == "/dav/")
+
+        // ── 2. OPTIONS advertises CalDAV + CardDAV ──────────────────
+        let optWire: string = dav.Dispatch(HttpParser.ParseFull(
+            Program.raw("OPTIONS", "/dav/", Program.hdrs(), ""))).Render()
+        let opt: HttpResponse = HttpParser.ParseResponse(optWire)
+        c.Ok("OPTIONS DAV: calendar-access + addressbook (re-parsed wire)",
+            opt.StatusCode == 200
+            && Program.has(HttpParser.HeaderValue(opt, "dav"), "calendar-access")
+            && Program.has(HttpParser.HeaderValue(opt, "dav"), "addressbook"))
+
+        // ── 3. principal/home-set discovery (Depth: 0) ──────────────
+        let pfPrincipalBody: string = "<?xml version=\"1.0\" encoding=\"utf-8\"?>" +
+            "<d:propfind xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\">" +
+            "<d:prop><d:current-user-principal/><c:calendar-home-set/></d:prop></d:propfind>"
+        let dh0: List<string> = Program.hdrs()
+        dh0.Add("Depth: 0")
+        dh0.Add("Content-Type: application/xml; charset=utf-8")
+        dh0.Add("User-Agent: DAVx5/4.3.3")
+        let discWire: string = dav.Dispatch(HttpParser.ParseFull(
+            Program.raw("PROPFIND", "/dav/", dh0, pfPrincipalBody))).Render()
+        let disc: HttpResponse = HttpParser.ParseResponse(discWire)
+        c.Ok("PROPFIND /dav/ Depth:0 → 207 with home-set pointers",
+            disc.StatusCode == 207
+            && Program.has(disc.BodyText, "<D:current-user-principal>")
+            && Program.has(disc.BodyText, "<C:calendar-home-set><D:href>/dav/</D:href>"))
+
+        // ── 4. enumerate the home-set (Depth: 1) ────────────────────
+        let dh1: List<string> = Program.hdrs()
+        dh1.Add("Depth: 1")
+        let homeWire: string = dav.Dispatch(HttpParser.ParseFull(
+            Program.raw("PROPFIND", "/dav/", dh1, ""))).Render()
+        let home: HttpResponse = HttpParser.ParseResponse(homeWire)
+        c.Ok("PROPFIND /dav/ Depth:1 lists the calendar collection",
+            home.StatusCode == 207
+            && Program.has(home.BodyText, "/dav/cal/")
+            && Program.has(home.BodyText, "<C:calendar/>")
+            && Program.has(home.BodyText, "<CS:getctag>")
+            && Program.has(home.BodyText, "supported-calendar-component-set"))
+
+        // ── 5. enumerate calendar members (Depth: 1) ────────────────
+        let memWire: string = dav.Dispatch(HttpParser.ParseFull(
+            Program.raw("PROPFIND", "/dav/cal/", dh1, ""))).Render()
+        let mem: HttpResponse = HttpParser.ParseResponse(memWire)
+        c.Ok("PROPFIND /dav/cal/ Depth:1 lists evt1.ics with getetag",
+            mem.StatusCode == 207
+            && Program.has(mem.BodyText, "/dav/cal/evt1.ics")
+            && Program.has(mem.BodyText, "<D:getetag>"))
+
+        // ── 6. calendar-multiget REPORT returns inline UTF-8 data ───
+        let mgBody: string = "<?xml version=\"1.0\" encoding=\"utf-8\"?>" +
+            "<c:calendar-multiget xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\">" +
+            "<d:prop><d:getetag/><c:calendar-data/></d:prop>" +
+            "<d:href>/dav/cal/evt1.ics</d:href></c:calendar-multiget>"
+        let rh: List<string> = Program.hdrs()
+        rh.Add("Depth: 1")
+        rh.Add("Content-Type: application/xml; charset=utf-8")
+        let mgWire: string = dav.Dispatch(HttpParser.ParseFull(
+            Program.raw("REPORT", "/dav/cal/", rh, mgBody))).Render()
+        let mg: HttpResponse = HttpParser.ParseResponse(mgWire)
+        c.Ok("REPORT calendar-multiget → 207 with inline calendar-data",
+            mg.StatusCode == 207
+            && Program.has(mg.BodyText, "<C:calendar-data>")
+            && Program.has(mg.BodyText, "Réunion café")
+            && Program.has(mg.BodyText, "<D:getetag>"))
+
+        // ── 7. MARQUEE: Content-Length == true UTF-8 byte length ────
+        // The multiget body carries multi-byte UTF-8; a client reads
+        // exactly Content-Length bytes. If the header is a CHARACTER
+        // count it is < the byte count and the client sees truncated XML.
+        let clHeader: int = Program.ToInt(HttpParser.HeaderValue(mg, "content-length"))
+        let trueBytes: int = Program.ByteLen(mg.BodyText)
+        c.Note("multiget Content-Length=" + String_FromInt(clHeader)
+            + " trueBytes=" + String_FromInt(trueBytes)
+            + " strlen-disc=" + String_FromInt(trueBytes - clHeader))
+        c.Ok("Content-Length matches true UTF-8 byte length (no truncation)",
+            clHeader == trueBytes)
+
+        // ── 8. discovery chain coherence ────────────────────────────
+        // The calendar-home-set href advertised in step 3 (/dav/) must,
+        // when a client PROPFINDs it back, resolve to a real collection.
+        let backWire: string = dav.Dispatch(HttpParser.ParseFull(
+            Program.raw("PROPFIND", "/dav/", dh0, ""))).Render()
+        let back: HttpResponse = HttpParser.ParseResponse(backWire)
+        c.Ok("home-set href round-trips to a 207 collection",
+            back.StatusCode == 207)
+
+        // ── 9. status-line reason phrase for 207 (informational) ────
+        if (Program.has(discWire, "207 Multi-Status")) {
+            c.Note("207 reason phrase = Multi-Status (RFC-correct)")
+        } else {
+            c.Note("207 reason phrase = '" + String_Substring(discWire, 9,
+                String_IndexOf(discWire, crlf) - 9)
+                + "' (clients key off the numeric code; production sets the line in C)")
+        }
+
+        Console.WriteLine("")
+        Console.WriteLine("CalDAV live: " + String_FromInt(c.Pass) + "/"
+            + String_FromInt(c.Total) + " passed")
+    }
+}

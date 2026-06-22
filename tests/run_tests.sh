@@ -148,7 +148,8 @@ build_and_run() {
     return 0
 }
 
-build_and_run webdav_test tests/webdav_test.am
+build_and_run webdav_test      tests/webdav_test.am
+build_and_run caldav_live_test tests/caldav_live_test.am
 
 echo ""
 if [ "$FAILED" -eq 0 ]; then echo -e "${GREEN}All tests passed${NC}"; else echo -e "${RED}Some tests FAILED${NC}"; exit 1; fi
