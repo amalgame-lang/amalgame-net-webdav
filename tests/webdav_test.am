@@ -326,6 +326,18 @@ public class Program {
         c.Ok("REPORT addressbook-multiget → 207 + address-data",
             amgr.StatusCode == 207 && Program.has(amgr.BodyText, "address-data") && Program.has(amgr.BodyText, "VCARD"))
 
+        // Discovery: .well-known → 301; root PROPFIND exposes principal + home-sets.
+        let wk = dav.Dispatch(Program.req("GET", "/.well-known/caldav"))
+        c.Ok("/.well-known/caldav → 301 + Location",
+            wk.StatusCode == 301 && Program.has(wk.Headers.Get("Location"), "/dav/"))
+
+        let dpf = dav.Dispatch(Program.req("PROPFIND", "/dav/"))
+        c.Ok("PROPFIND root → current-user-principal + home-sets",
+            dpf.StatusCode == 207
+            && Program.has(dpf.BodyText, "current-user-principal")
+            && Program.has(dpf.BodyText, "calendar-home-set")
+            && Program.has(dpf.BodyText, "addressbook-home-set"))
+
         // cleanup
         Filesystem.Remove(root)
 
