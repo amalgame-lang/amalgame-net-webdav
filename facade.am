@@ -466,17 +466,21 @@ public class WebDav {
         x = x + "<D:propstat><D:prop>"
         x = x + "<D:displayname>" + WebDav.XmlEscape(name) + "</D:displayname>"
         if (isDir) {
-            // Discovery pointers (RFC 6764 / 4791 / 6352). The engine is
-            // single-principal, so principal + home both resolve to the mount
-            // root — a client PROPFINDs here, follows calendar-home-set back to
-            // this same collection, and lists the MKCALENDAR'd collections
-            // under it. WebDavNas overrides these per authenticated user.
-            let home: string = this.Prefix + "/"
-            let hEsc: string = WebDav.XmlEscape(home)
-            x = x + "<D:current-user-principal><D:href>" + hEsc + "</D:href></D:current-user-principal>"
-            x = x + "<D:principal-URL><D:href>" + hEsc + "</D:href></D:principal-URL>"
-            x = x + "<C:calendar-home-set><D:href>" + hEsc + "</D:href></C:calendar-home-set>"
-            x = x + "<CARD:addressbook-home-set><D:href>" + hEsc + "</D:href></CARD:addressbook-home-set>"
+            // Discovery pointers (RFC 6764 / 4791 / 6352) — emitted ONLY on the
+            // mount root entry (rel == ""), NOT on every listed child. Emitting
+            // principal-URL/current-user-principal (href = mount root) on each
+            // subfolder made the Windows WebDAV redirector follow that href and
+            // name EVERY folder after the root collection (e.g. all of /groups/GB/*
+            // displayed as "GB"). CalDAV/CardDAV home discovery only needs them on
+            // the collection root. WebDavNas overrides these per authenticated user.
+            if (String_Length(rel) == 0) {
+                let home: string = this.Prefix + "/"
+                let hEsc: string = WebDav.XmlEscape(home)
+                x = x + "<D:current-user-principal><D:href>" + hEsc + "</D:href></D:current-user-principal>"
+                x = x + "<D:principal-URL><D:href>" + hEsc + "</D:href></D:principal-URL>"
+                x = x + "<C:calendar-home-set><D:href>" + hEsc + "</D:href></C:calendar-home-set>"
+                x = x + "<CARD:addressbook-home-set><D:href>" + hEsc + "</D:href></CARD:addressbook-home-set>"
+            }
             let kind: int = WebDav.CollKindGet(fs)
             if (kind == 1) {
                 x = x + "<D:resourcetype><D:collection/><C:calendar/></D:resourcetype>"
